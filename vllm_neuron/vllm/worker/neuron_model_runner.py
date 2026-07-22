@@ -415,7 +415,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         self._tensor_capture_model = None
         self._capture_registry = None
         model_config = vllm_config.model_config
-        self.is_pooling_model = False
+        # Pooling/embedding models run forward -> hidden states -> pooler ->
+        # embedding. Derive the mode from the resolved runner_type.
+        self.is_pooling_model = model_config.runner_type == "pooling"
+        self._pooling_num_scheduled_tokens_per_seq: np.ndarray | None = None
+        # Multi-sequence prefill packing for pooling (throughput; short embedding
+        # prompts otherwise waste most of a padded bucket). Gated behind
+        # VLLM_NEURON_POOLING_PACK (default ON), mirroring the NeuronScheduler.
+        # When ON, _create_padded_inputs lays sequences out densely as
+        # [seq0_real, seq1_real, ..., trailing_pad] in a single bucket.
+        self._pooling_pack = self.is_pooling_model and (
+            os.environ.get("VLLM_NEURON_POOLING_PACK", "1") == "1"
+        )
+        # On-device [B, H] gather (perf optimization; ON by default). The pooling
+        # model pools MEAN+L2 on-device and returns a fixed-shape [max_num_seqs, H]
+        # embedding, so _pool skips the upstream cursor/pooler and just slices the
+        # first num_reqs rows. The runner supplies a fixed-shape pooling_seq_lens
+        # device tensor (the authoritative per-seq boundaries) to the model
+        # forward. Set VLLM_NEURON_POOLING_ONDEVICE_GATHER=0 to fall back to the
+        # mainline [T, H] + upstream DispatchPooler path.
+        self._pooling_ondevice_gather = self.is_pooling_model and (
+            os.environ.get("VLLM_NEURON_POOLING_ONDEVICE_GATHER", "1") != "0"
+        )
         self.uses_mrope = model_config.uses_mrope
         self.uses_xdrope_dim = model_config.uses_xdrope_dim
 
@@ -2604,6 +2625,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         actual_num_tokens = np.array(actual_tokens_list, dtype=np.int64)
 
+        # Persist per-request scheduled token counts for the pooling path:
+        # _pool() (called from sample_tokens) needs them to build the pooling
+        # cursor's gather indices over the flattened [T, H] buffer.
+        self._pooling_num_scheduled_tokens_per_seq = actual_num_tokens
+
         logger.debug(
             "Token counts: scheduled=%s, actual=%s",
             num_scheduled_tokens_padded.tolist(),
@@ -3251,6 +3277,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 "INPUT_PADDING: self.requests not available, skipping padding"
             )
             return input_ids, positions, rotary_position_ids, padding_map
+
+        # ── Pooling/embedding + pack: PACK sequences densely into one bucket. ──
+        # input_ids/positions already arrive as dense real tokens in req_ids
+        # order ([seq0_real, seq1_real, ...]); we just append ONE trailing pad
+        # block to reach the bucket total. This [reals..., trailing_pad] layout
+        # is what the upstream pooling cursor (cumsum over ACTUAL per-seq counts)
+        # and the model's per-sequence key_bounds expect, and is robust to
+        # scheduler/runner req ordering (the runner controls both the packing and
+        # the trailing pad). Gated on the same env as the scheduler's pack path;
+        # the generative branch below is left entirely unchanged.
+        if getattr(self, "_pooling_pack", False):
+            bucket_total = int(num_scheduled_tokens_padded.sum())
+            real_total = int(input_ids.shape[0])
+            pad_total = bucket_total - real_total
+            if pad_total <= 0:
+                return input_ids, positions, rotary_position_ids, padding_map
+            pad_ids = torch.zeros(pad_total, dtype=input_ids.dtype)
+            last_pos = positions[-1].item() if positions.numel() > 0 else 0
+            pad_positions = torch.full((pad_total,), last_pos, dtype=positions.dtype)
+            final_input_ids = torch.cat([input_ids, pad_ids])
+            final_positions = torch.cat([positions, pad_positions])
+            # Attribute all padding to the last runner request so the downstream
+            # slot_mapping loop (which walks req_ids order) marks exactly the
+            # trailing region as PAD_SLOT_ID.
+            if req_ids:
+                padding_map[req_ids[-1]] = pad_total
+            logger.debug(
+                "POOLING PACK (runner): %d real tokens + %d trailing pad = %d (bucket)",
+                real_total, pad_total, bucket_total,
+            )
+            # Pooling models never use M-RoPE, so rotary_position_ids is None.
+            return final_input_ids, final_positions, rotary_position_ids, padding_map
 
         # Check if any requests need padding (prefill requests)
         # NOTE: A request is in prefill if num_computed_tokens < num_prompt_tokens.
@@ -4296,6 +4354,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         )
         if rotary_position_ids is not None:
             warmup_kwargs["rotary_position_ids"] = rotary_position_ids
+        # On-device gather: mirror the runtime pooling_seq_lens (fixed shape
+        # [max_num_reqs], zero-padded) so the traced NEFF matches. Warmup is a
+        # single synthetic sequence of num_tokens.
+        if self._pooling_ondevice_gather:
+            seq_lens_list = [num_tokens] + [0] * (self.max_num_reqs - 1)
+            warmup_kwargs["pooling_seq_lens"] = torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=device
+            )
         if self.supports_mm_inputs:
             max_num_vision_blocks = self.max_vision_blocks_per_request
             warmup_kwargs["vision_embedding_blocks"] = tuple(
@@ -5402,6 +5468,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             record_function_or_nullcontext("neuron_model_runner: sample"),
             torch.compiler.set_stance("force_eager"),
         ):
+            if self.is_pooling_model:
+                # For pooling models, model_output_tensor carries the flattened
+                # [T, H] hidden states: run the pooler head and
+                # return the embeddings, bypassing the sampler entirely.
+                return self._pool(
+                    model_output_tensor,
+                    self._pooling_num_scheduled_tokens_per_seq,
+                )
             sampler_output = self._sample(model_output_tensor, spec_decode_metadata)
 
         # Capture raw sampler output for the draft model's on-device token
@@ -6345,6 +6419,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if rotary_position_ids is not None:
             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
 
+        # On-device [B, H] gather: pass a FIXED-shape [max_num_seqs] pooling_seq_lens
+        # (zero-padded, on device) so the model can MEAN-pool per sequence on device
+        # and return [max_num_seqs, H]. Fixed shape keeps the traced NEFF stable
+        # across batch sizes (trailing zero-length seqs pool nothing).
+        if self._pooling_ondevice_gather:
+            counts = self._pooling_num_scheduled_tokens_per_seq
+            n = 0 if counts is None else len(counts)
+            seq_lens_list = (
+                (list(counts[: self.max_num_reqs]) if counts is not None else [])
+                + [0] * (self.max_num_reqs - min(n, self.max_num_reqs))
+            )
+            model_kwargs["pooling_seq_lens"] = torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=self.device
+            )
+
         # On-device num_computed_tokens correction (async spec decode only).
         # Provide the previous step's rejection sampler output and the per-
         # scheduled-token request index so the target NEFF can subtract
@@ -7244,6 +7333,105 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
 
         return partial_prefill_req_ids
 
+    def _pool(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> ModelRunnerOutput:
+        """Run the pooler head on backbone hidden states and emit pooler_output.
+
+        Args:
+            hidden_states: Flattened ``[T, H]`` backbone hidden states.
+            num_scheduled_tokens_np: Per-request scheduled token counts
+                ``[num_reqs]``, used to build the pooling cursor's gather
+                indices over the flattened buffer.
+
+        Returns:
+            ModelRunnerOutput whose ``pooler_output`` is a list of per-request
+            CPU tensors (or None for unfinished requests).
+        """
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs == len(self.input_batch.pooling_params), (
+            "Either all or none of the requests in a batch must be pooling"
+        )
+        # Pooling has no decode loop, so async scheduling does not apply.
+        assert not self.use_async_scheduling, (
+            "Async scheduling is not supported for pooling models."
+        )
+
+        # On-device [B, H] gather: the model already pooled MEAN+L2 and returned a
+        # fixed-shape [max_num_seqs, H] embedding tensor (per-seq rows in req
+        # order). Skip the upstream cursor/pooler entirely — just take the first
+        # num_reqs rows. hidden_states is on CPU here (moved in
+        # _execute_model_forward), same as the [T, H] path.
+        if self._pooling_ondevice_gather:
+            seq_lens_cpu = torch.from_numpy(
+                self.input_batch.num_prompt_tokens[:num_reqs]
+            )
+            finished_mask = [
+                seq_len == self.input_batch.num_prompt_tokens[i]
+                for i, seq_len in enumerate(seq_lens_cpu)
+            ]
+            output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids.copy(),
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                kv_connector_output=None,
+            )
+            rows = [hidden_states[i] for i in range(num_reqs)]
+            output.pooler_output = self._copy_pooler_output_to_cpu(
+                rows, finished_mask
+            )
+            return output
+
+        # Prefill-only on Neuron => sequence length == prompt length.
+        seq_lens_cpu = torch.from_numpy(self.input_batch.num_prompt_tokens[:num_reqs])
+
+        pooling_metadata = self.input_batch.get_pooling_metadata()
+        pooling_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np, seq_lens_cpu, device=hidden_states.device
+        )
+
+        model = cast(VllmModelForPooling, self.get_model())
+        raw_pooler_output = model.pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
+
+        finished_mask = [
+            seq_len == prompt_len
+            for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
+        ]
+
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            # Pooling models never do KV transfer, so this is always None.
+            kv_connector_output=None,
+        )
+
+        if raw_pooler_output is None or not any(finished_mask):
+            output.pooler_output = [None] * num_reqs
+            return output
+
+        output.pooler_output = self._copy_pooler_output_to_cpu(
+            raw_pooler_output, finished_mask
+        )
+        return output
+
+    @staticmethod
+    def _copy_pooler_output_to_cpu(
+        raw_pooler_output: "torch.Tensor | list[torch.Tensor | None]",
+        finished_mask: list[bool],
+    ) -> list[torch.Tensor | None]:
+        if isinstance(raw_pooler_output, torch.Tensor):
+            cpu_rows: list[torch.Tensor | None] = list(raw_pooler_output.to("cpu"))
+        else:
+            cpu_rows = [
+                None if row is None else row.to("cpu") for row in raw_pooler_output
+            ]
+        return [
+            row if include else None for row, include in zip(cpu_rows, finished_mask)
+        ]
+
     def _sample(
         self,
         model_output_tensor: torch.Tensor,
@@ -7666,8 +7854,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             kernel_block_sizes=block_sizes,
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
-            # Neuron doesn't support pooling models yet
-            is_pooling_model=False,
+            is_pooling_model=self.is_pooling_model,
         )
 
         # Initialize the KV Cache tensors
@@ -8243,9 +8430,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         """
         Get the tasks supported by this model runner.
 
+        For pooling models, reports the pooler's tasks (e.g. ("embed",)) so the
+        engine/API layer mounts the matching endpoints (e.g. /v1/embeddings);
+        otherwise reports generation.
+
         Returns:
             Tuple of supported tasks
         """
+        if self.vllm_config.model_config.runner_type == "pooling":
+            return tuple(self.get_model().pooler.get_supported_tasks())
         return ("generate",)
 
     def ensure_kv_transfer_shutdown(self) -> None:

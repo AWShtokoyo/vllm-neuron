@@ -703,12 +703,24 @@ def _apply_platform_compiler_args(options: dict) -> dict:
     compiler_args = _parse_compiler_args(options.get("compiler_args", ""))
     target = resolve_target(compiler_args)
 
+    # Opt-in: force single-core codegen (--logical-nc-config=1).
+    # The neuronx-cc LNC=2 auto-partitioner mis-shards certain all-PyTorch
+    # (no NKI kernel) graphs, failing with "[NCC_IXRO002] Undefined SB Memloc"
+    # / ShrinkDN "writing 0 elements per partition" on batched matmul/deconcat
+    # nodes (observed for the llama_bidirec bidirectional embedding model at
+    # TP=1, whose attention + MLP both fall back to PyTorch). The exact same
+    # HLO compiles cleanly at --logical-nc-config=1. Models whose graphs contain
+    # NKI kernels (grid=(2,)) must keep LNC=2 and should NOT set this env.
+    if os.environ.get("VLLM_NEURON_FORCE_LNC1") == "1":
+        if "--logical-nc-config" not in compiler_args:
+            compiler_args = list(compiler_args) + ["--logical-nc-config", "1"]
+
     if target == "trn2":
         compiler_args = _inject_hlo2tensorizer_opt(
             compiler_args, "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
         )
     else:
-        return options
+        return {**options, "compiler_args": compiler_args}
 
     return {**options, "compiler_args": compiler_args}
 

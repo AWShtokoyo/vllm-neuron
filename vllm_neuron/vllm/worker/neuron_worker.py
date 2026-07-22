@@ -958,8 +958,12 @@ class NeuronWorker(WorkerBase):
             kv_cfg is not None and kv_cfg.is_kv_consumer and not kv_cfg.is_kv_producer
         ) or envs.VLLM_NEURON_SKIP_PREFILL_WARMUP
         skip_decode_warmup = (
-            kv_cfg is not None and kv_cfg.is_kv_producer and not kv_cfg.is_kv_consumer
-        ) or envs.VLLM_NEURON_SKIP_DECODE_WARMUP
+            (kv_cfg is not None and kv_cfg.is_kv_producer and not kv_cfg.is_kv_consumer)
+            or envs.VLLM_NEURON_SKIP_DECODE_WARMUP
+            # Pooling models are prefill-only (no autoregressive decode), so skip
+            # decode graph extraction + warmup entirely.
+            or self.model_runner.is_pooling_model
+        )
 
         # === Graph extraction (capture HLO for prefill + decode + vision) ===
         # All extracts run before any warmup so the parallel-trace fork

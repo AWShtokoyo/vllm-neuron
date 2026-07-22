@@ -19,6 +19,7 @@ MAX_HEAD_DIM = 128
 # TODO: Define this NKI attention_cte kernel constraints check in NKILIB
 def _can_use_flash_attention_kernel(
     v: Tensor,
+    causal_mask: bool = True,
 ) -> bool:
     """
     Check if the NKI attention_cte kernel can be used based on constraints.
@@ -26,6 +27,20 @@ def _can_use_flash_attention_kernel(
     """
 
     if not can_run_kernel(v):
+        return False
+
+    # NKI-XXXX: The non-causal (causal_mask=False) attention_cte path in the
+    # currently installed nkilib build corrupts the heap at runtime ("double
+    # free or corruption" / SIGSEGV inside ExecuteComputation) on the FIRST
+    # graph execution. Reproduced in isolation across every layout we tried
+    # (tp_q True/False, tp_out True/False), with and without per-query
+    # bound_min/bound_max, and for both grid=(1,) and grid=(2,). The causal
+    # path is unaffected. Until the kernel is fixed upstream, route all
+    # bidirectional / non-causal attention through the PyTorch fallback, which
+    # runs correctly on device (cos>0.9999 vs CPU reference). This is a
+    # correctness-over-performance trade-off for bidirectional/embedding models
+    # (e.g. llama_bidirec). Causal models are unaffected and keep the kernel.
+    if not causal_mask:
         return False
 
     # V is always [B, S, D]
@@ -79,19 +94,26 @@ def _torch_attention_impl(
     bs_kv = k.shape[0]
 
     # Get dimensions and prepare Q for matmul [B, S_q, D]
+    # NOTE: .contiguous() after transpose is deliberate. Feeding a transposed
+    # (stride-permuted) view directly into a batched torch.matmul triggers the
+    # Neuron compiler's mm-transpose-remat path, which on this build fails with
+    # "[NCC_IXRO002] Undefined SB Memloc dot.<id>_iN" on the per-batch deconcat
+    # tiles when this fallback is fused into a large graph (e.g. the 32-layer
+    # bidirectional llama_bidirec at TP=1). Materializing the transpose makes
+    # the matmul operand a plain contiguous tensor and avoids the bug.
     if tp_q:
         q_for_matmul = q  # [B, S_q, D]
         seqlen_q, d = q.shape[1], q.shape[2]
     else:
-        q_for_matmul = q.transpose(-2, -1)  # [B, D, S_q] -> [B, S_q, D]
+        q_for_matmul = q.transpose(-2, -1).contiguous()  # [B, D, S_q] -> [B, S_q, D]
         d, seqlen_q = q.shape[1], q.shape[2]
 
     # Prepare K for matmul - need [B, D, S_k] for Q @ K
     if tp_k:
-        k_for_matmul = k.transpose(-2, -1)  # [B, S_k, D] -> [B, D, S_k]
+        k_for_matmul = k.transpose(-2, -1).contiguous()  # [B, S_k, D] -> [B, D, S_k]
         seqlen_k = k.shape[1]
     else:
-        k_for_matmul = k  # [B, D, S_k]
+        k_for_matmul = k.contiguous()  # [B, D, S_k]
         seqlen_k = k.shape[2]
 
     # Handle prefix caching - concatenate prior K/V
@@ -292,7 +314,7 @@ def flash_attention(
         d_head = v.shape[2]
         scale = 1.0 / (d_head**0.5)
 
-    can_use_kernel = _can_use_flash_attention_kernel(v=v)
+    can_use_kernel = _can_use_flash_attention_kernel(v=v, causal_mask=causal_mask)
 
     if can_use_kernel:
         q = q * scale

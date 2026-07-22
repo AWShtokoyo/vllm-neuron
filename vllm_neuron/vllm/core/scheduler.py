@@ -9,6 +9,7 @@ bucket-aware admission control.
 
 import inspect
 import logging
+import os
 from collections import deque
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -197,8 +198,27 @@ class NeuronScheduler(Scheduler):
                 self.num_batched_tokens_buckets,
             )
 
-        # Prefill batch size limit (currently 1, may expand in future)
-        self.max_prefills_per_batch: int = 1
+        # Pooling/embedding models are prefill-only (no decode/KV/sampling), so
+        # MULTIPLE sequences can be PACKED into one prefill bucket for throughput
+        # (short embedding prompts otherwise waste most of a padded bucket). This
+        # is gated behind VLLM_NEURON_POOLING_PACK (default ON) so it can be
+        # disabled to fall back to the simpler one-prefill-per-batch path; the
+        # generative (CausalLM) path is never affected either way.
+        self.is_pooling = (
+            getattr(vllm_config.model_config, "runner_type", None) == "pooling"
+        )
+        self.pooling_pack = self.is_pooling and (
+            os.environ.get("VLLM_NEURON_POOLING_PACK", "1") == "1"
+        )
+
+        # Prefill batch size limit. Generative models: 1 (Neuron prefill/decode
+        # separation assumes a single prefill, then decode). Pooling/embedding
+        # models with packing enabled admit up to max_num_seqs prefills and pack
+        # them into one bucket (see _apply_pooling_pack_padding and the runner's
+        # _create_padded_inputs pooling branch) — the throughput win.
+        self.max_prefills_per_batch: int = (
+            self.max_num_seqs if self.pooling_pack else 1
+        )
 
         # Parse num_seqs_buckets for decode batch size buckets
         if "num_seqs_buckets" in neuron_config:
@@ -549,9 +569,31 @@ class NeuronScheduler(Scheduler):
         if self.has_prefill_in_running:
             return False
 
-        # Check prefill batch capacity (only 1 prefill at a time)
+        # Check prefill batch capacity (generative: 1; pooling+pack: up to
+        # max_num_seqs).
         if len(self.waiting) >= self.max_prefills_per_batch:
             return False
+
+        # Pooling+pack: multiple sequences are PACKED into one prefill bucket, so
+        # the COMBINED token count (already-admitted in self.waiting + this
+        # candidate) must fit the largest bucket. Otherwise stop admitting and
+        # let the already-admitted ones run this step (the candidate waits for
+        # the next batch). The generative path skips this (single prefill;
+        # chunked prefill handles length).
+        if self.pooling_pack and self.num_batched_tokens_buckets:
+            already = sum(
+                self.requests[r.request_id].num_prompt_tokens
+                for r in self.waiting
+                if r.request_id in self.requests
+            )
+            candidate = request.num_prompt_tokens
+            if already > 0 and already + candidate > self.num_batched_tokens_buckets[-1]:
+                logger.debug(
+                    "Pooling pack full: %d already + %d candidate > bucket %d; "
+                    "deferring this request to next batch.",
+                    already, candidate, self.num_batched_tokens_buckets[-1],
+                )
+                return False
 
         # Prevent livelock: don't admit a new prefill if running requests
         # already saturate KV cache capacity at worst-case (max_model_len).
@@ -647,6 +689,11 @@ class NeuronScheduler(Scheduler):
             cached_reqs = scheduler_output.scheduled_cached_reqs
             for i, req_id in enumerate(cached_reqs.req_ids):
                 req_num_computed[req_id] = cached_reqs.num_computed_tokens[i]
+
+        # Pooling+pack: PACK all prefill sequences into ONE bucket (throughput).
+        # The generative path below is left entirely unchanged.
+        if self.pooling_pack:
+            return self._apply_pooling_pack_padding(scheduler_output, req_num_computed)
 
         prefill_count = 0
         decode_count = 0
@@ -780,6 +827,62 @@ class NeuronScheduler(Scheduler):
                 overhead,
             )
 
+        return scheduler_output
+
+    def _apply_pooling_pack_padding(
+        self,
+        scheduler_output: "SchedulerOutput",
+        req_num_computed: dict[str, int],
+    ) -> "SchedulerOutput":
+        """Pooling-only: pack all prefill sequences into ONE bucket.
+
+        Unlike the generative path (one prefill, padded to its own bucket), an
+        embedding batch holds several short sequences that we want to run in a
+        single prefill. We size the batch to ONE bucket = bucket(sum of actual
+        tokens), and put ALL of the padding on the LAST request. The runner's
+        _create_padded_inputs pooling branch then lays tokens out densely as
+        [seq0_real, seq1_real, ..., trailing_pad], which is exactly what the
+        upstream pooling cursor (built from the ACTUAL per-seq token counts) and
+        the model's per-sequence key_bounds expect. num_scheduled_tokens stays
+        the ACTUAL per-seq count (those are the pooling boundaries); only
+        num_scheduled_tokens_padded is inflated, and only on the final request,
+        to reach the bucket total.
+
+        Pooling is prefill-only, so there are no decode requests to consider.
+        """
+        # Per-req actual prefill token counts, in scheduler dict order.
+        actual = {}
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            actual[req_id] = num_tokens
+
+        total_actual = sum(actual.values())
+        if total_actual == 0:
+            return scheduler_output
+
+        bucket_total = self._calculate_padded_count(total_actual)
+        pad_total = bucket_total - total_actual
+
+        # Default: padded == actual for every request; dump all padding on the last.
+        req_ids = list(actual.keys())
+        for req_id in req_ids:
+            scheduler_output.num_scheduled_tokens_padded[req_id] = actual[req_id]
+        last = req_ids[-1]
+        scheduler_output.num_scheduled_tokens_padded[last] = actual[last] + pad_total
+
+        # Stats / metric (mirror the generative branch's accounting).
+        self.total_padding_tokens += pad_total
+        self.total_scheduled_tokens += total_actual
+        bucket_name = f"prefill_s{bucket_total}"
+        NUM_BATCHED_TOKENS_PADDING.labels(
+            model_name=self.model_name, bucket_name=bucket_name
+        ).observe(bucket_total)
+        logger.debug(
+            "POOLING PACK: %d seqs, %d actual tokens -> bucket %d (+%d pad on %s)",
+            len(req_ids), total_actual, bucket_total, pad_total, last,
+        )
         return scheduler_output
 
     def schedule(self) -> "SchedulerOutput":

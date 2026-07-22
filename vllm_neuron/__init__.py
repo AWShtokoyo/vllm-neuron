@@ -218,8 +218,33 @@ def register():
     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
 
     _patch_dcp_config_validation()
+    _register_llama_bidirec_hf_config()
 
     return get_platform_class()
+
+
+def _register_llama_bidirec_hf_config() -> None:
+    """Register the LlamaBidirectional model_type with HuggingFace AutoConfig.
+
+    nvidia/llama-embed-nemotron-8b uses model_type `llama_bidirec`, which is not
+    in the public transformers CONFIG_MAPPING. We register a minimal config that
+    subclasses LlamaConfig and carries the `pooling`/`temperature` fields, so
+    vLLM's AutoConfig.from_pretrained() does not raise KeyError.
+    """
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    class _LlamaBidirecHFConfig(LlamaConfig):
+        model_type = "llama_bidirec"
+
+        def __init__(self, pooling="avg", temperature=1.0, **kwargs):
+            self.pooling = pooling
+            self.temperature = temperature
+            super().__init__(**kwargs)
+
+    if "llama_bidirec" not in CONFIG_MAPPING:
+        AutoConfig.register("llama_bidirec", _LlamaBidirecHFConfig)
 
 
 def __getattr__(name):
