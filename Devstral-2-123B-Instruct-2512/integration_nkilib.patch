@@ -1,0 +1,702 @@
+diff --git a/nkilib/core/mlp/mlp_cte/mlp_cte.py b/nkilib/core/mlp/mlp_cte/mlp_cte.py
+index 7f3a59a..b7254f0 100644
+--- a/nkilib/core/mlp/mlp_cte/mlp_cte.py
++++ b/nkilib/core/mlp/mlp_cte/mlp_cte.py
+@@ -45,6 +45,7 @@ from .mlp_cte_constants import (
+     MLPCTEConstants,
+     build_mlp_cte_constants,
+     cleanup_mlp_cte_constants,
++    mlp_cte_use_bf16_xpose_src,
+ )
+ from .mlp_cte_norm import (
+     apply_normalization_if_necessary,
+@@ -76,6 +77,7 @@ from .mlp_cte_tile_info import (
+     build_mlp_cte_tile_info,
+ )
+ from .mlp_cte_transpose import (
++    load_normalize_transpose_quantize_source_tile_bf16,
+     transpose_intermediate_tensor_tile,
+     transpose_source_tensor_tile,
+ )
+@@ -449,6 +451,9 @@ def _mlp_cte_single_shard(
+             # Create indices for standardized naming
+             indices = MlpBxsIndices(program_id, shard_idx, batch_idx, bxs_tile_idx)
+ 
++            # Env-gated bf16-transpose-then-quantize STATIC FP8 source path (see mlp_cte_constants).
++            use_bf16_xpose_src = mlp_cte_use_bf16_xpose_src(mlp_params)
++
+             # Create sbuf array for input tensor data for the current hidden tensor tile
+             hidden_tile_sbuf_list = []
+             hidden_tile_scales_sbuf_list = []
+@@ -476,58 +481,87 @@ def _mlp_cte_single_shard(
+                 sbm,
+             )
+ 
+-            # Load the hidden tensor tile with optional fused add and optional storage of fused add result
+-            load_hidden_tensor_tile_opt_fused_add(
+-                mlp_params,
+-                tile_info,
+-                constants,
+-                indices,
+-                hidden_tile_sbuf_list,
+-                hidden_tile_scales_sbuf_list,
+-                output_stored_add_tensor_hbm,
+-            )
+-            # Apply normalization if it has been specified in the kernel parameters
+-            apply_normalization_if_necessary(
+-                mlp_params,
+-                tile_info,
+-                constants,
+-                indices,
+-                hidden_tile_sbuf_list,
+-                hidden_tile_sbuf_list,
+-                heap_alloc,
+-            )
+-
+-            # Mark that norm buffers have been allocated (if normalization is enabled)
+-            if mlpp_has_normalization(mlp_params):
+-                cleanup_heap_for_normalization(mlp_params, tile_info, sbm)
+-
+-            # Declare our SBUF tensor for the source projection weights.
+-            # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
+-            src_proj_weights_sbuf_list = []
+-            allocate_src_projection_weights(
+-                mlp_params,
+-                tile_info,
+-                constants,
+-                indices,
+-                src_proj_weights_sbuf_list,
+-                sbm,
+-            )
++            if use_bf16_xpose_src:
++                # Env-gated STATIC FP8 path: stream the bf16 hidden, RMS-normalize, transpose it in
++                # bf16, and quantize the transposed result into the persistent fp8 source buffer.
++                # This avoids the gen3-broken fp8 step-2 PE-transpose. The bf16 activation footprint
++                # stays bounded (small streamed scratch); the persistent buffer (hidden_tile_sbuf) is
++                # fp8. The source projection weights are allocated afterwards so the bf16 scratch and
++                # the weight buffers do not coexist.
++                load_normalize_transpose_quantize_source_tile_bf16(
++                    mlp_params,
++                    tile_info,
++                    constants,
++                    indices,
++                    norm_weights_tensor_sbuf,
++                    gate_up_proj_static_input_scales_sbuf,
++                    hidden_tile_sbuf_list,
++                    sbm,
++                )
+ 
+-            # Perform transpose on the source tensor to prepare for up/gate projection matmuls
+-            # Apply norm weights (gamma) and norm bias on hidden normalized hidden tensor
+-            if not mlpp_has_dma_xpose(mlp_params):
+-                transpose_source_tensor_tile(
++                # Declare our SBUF tensor for the source projection weights.
++                src_proj_weights_sbuf_list = []
++                allocate_src_projection_weights(
++                    mlp_params,
++                    tile_info,
++                    constants,
++                    indices,
++                    src_proj_weights_sbuf_list,
++                    sbm,
++                )
++            else:
++                # Load the hidden tensor tile with optional fused add and optional storage of fused add result
++                load_hidden_tensor_tile_opt_fused_add(
+                     mlp_params,
+                     tile_info,
+                     constants,
+                     indices,
+                     hidden_tile_sbuf_list,
+-                    norm_weights_tensor_sbuf,
+-                    norm_bias_tensor_sbuf,
++                    hidden_tile_scales_sbuf_list,
++                    output_stored_add_tensor_hbm,
++                )
++                # Apply normalization if it has been specified in the kernel parameters
++                apply_normalization_if_necessary(
++                    mlp_params,
++                    tile_info,
++                    constants,
++                    indices,
+                     hidden_tile_sbuf_list,
++                    hidden_tile_sbuf_list,
++                    heap_alloc,
++                )
++
++                # Mark that norm buffers have been allocated (if normalization is enabled)
++                if mlpp_has_normalization(mlp_params):
++                    cleanup_heap_for_normalization(mlp_params, tile_info, sbm)
++
++                # Declare our SBUF tensor for the source projection weights.
++                # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
++                src_proj_weights_sbuf_list = []
++                allocate_src_projection_weights(
++                    mlp_params,
++                    tile_info,
++                    constants,
++                    indices,
++                    src_proj_weights_sbuf_list,
+                     sbm,
+                 )
+ 
++                # Perform transpose on the source tensor to prepare for up/gate projection matmuls
++                # Apply norm weights (gamma) and norm bias on hidden normalized hidden tensor
++                if not mlpp_has_dma_xpose(mlp_params):
++                    transpose_source_tensor_tile(
++                        mlp_params,
++                        tile_info,
++                        constants,
++                        indices,
++                        hidden_tile_sbuf_list,
++                        norm_weights_tensor_sbuf,
++                        norm_bias_tensor_sbuf,
++                        hidden_tile_sbuf_list,
++                        sbm,
++                    )
++
+             # Perform gate projection if it has been specified in the kernel parameters
+             perform_gate_projection_if_necessary(
+                 mlp_params,
+@@ -563,7 +597,7 @@ def _mlp_cte_single_shard(
+             if sbm != None:
+                 for weight_buffer_idx in range(len(src_proj_weights_sbuf_list)):
+                     sbm.pop_heap()  # src_proj_weights_sbuf
+-                if mlpp_has_quantized_input(mlp_params):
++                if mlpp_has_quantized_input(mlp_params) or use_bf16_xpose_src:
+                     for bxs_subtile_idx in range(len(hidden_tile_sbuf_list)):
+                         sbm.pop_heap()  # hidden_tile_sbuf
+ 
+@@ -627,7 +661,9 @@ def _mlp_cte_single_shard(
+                     sbm,
+                 )
+ 
+-            if mlpp_has_quantized_input(mlp_params):
++            if mlpp_has_quantized_input(mlp_params) or use_bf16_xpose_src:
++                # The persistent source buffer is fp8 (and already freed), so the bf16 down-projection
++                # output needs its own buffer. stack_alloc is freed by increment_section below.
+                 output_tile_sbuf_list = []
+                 for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                     output_tile_sbuf = stack_alloc(
+@@ -677,7 +713,7 @@ def _mlp_cte_single_shard(
+                     output_tensor_hbm,
+                 )
+ 
+-            if sbm != None and not mlpp_has_quantized_input(mlp_params):
++            if sbm != None and not mlpp_has_quantized_input(mlp_params) and not use_bf16_xpose_src:
+                 for bxs_subtile_idx in range(tile_info.bxs_dim_tile.subtile_dim_info.tile_count):
+                     sbm.pop_heap()  # output_tile_sbuf aka hidden_tile_sbuf
+ 
+diff --git a/nkilib/core/mlp/mlp_cte/mlp_cte_constants.py b/nkilib/core/mlp/mlp_cte/mlp_cte_constants.py
+index 8d7ecba..1faa2fd 100644
+--- a/nkilib/core/mlp/mlp_cte/mlp_cte_constants.py
++++ b/nkilib/core/mlp/mlp_cte/mlp_cte_constants.py
+@@ -14,6 +14,7 @@
+ 
+ """MLP CTE constants and configuration parameters for data types, buffer counts, and sharding."""
+ 
++import os
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+@@ -35,6 +36,39 @@ from ..mlp_parameters import (
+ from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
+ from .mlp_cte_tile_info import MLPCTETileInfo
+ 
++# Env-gated alternative source (gate/up) projection path for STATIC FP8 on gen3 (trn2).
++#
++# The default STATIC FP8 source path pre-quantizes the hidden activation to fp8 and then runs
++# the fp8 1-byte PE-transpose (psum_step_size=2 interleave) feeding the double_row matmul. That
++# fp8 step-2 transpose is numerically broken on gen3 (correct in nki.simulate, garbage on device).
++#
++# When this knob is set (and quantization is STATIC and the hidden is NOT already fp8), the source
++# projection instead mirrors the qkv_cte pattern: transpose the hidden activation in bf16
++# (psum_step_size=1, bf16 PSUM) and quantize the transposed bf16 result to fp8, so the double_row
++# matmul reads a contiguous fp8 buffer that never went through the step-2 interleave.
++#
++# To keep the bf16 activation footprint bounded (the persistent SBUF source buffer stays fp8, 1
++# byte/element, same as the working no-knob path), the hidden is streamed per [128, 512] H-tile:
++# bf16 lives only in a small reused scratch and transiently in PSUM during the transpose.
++#
++# Read once at import so the default-OFF path is byte-identical to HEAD.
++_MLP_BF16_XPOSE_SRC_ENABLED = os.environ.get("NKILIB_MLP_BF16_XPOSE_SRC", "0") == "1"
++
++
++def mlp_cte_use_bf16_xpose_src(mlp_params: MLPParameters) -> bool:
++    """True iff the env-gated bf16-transpose-then-quantize source path should be used.
++
++    Gated behind the NKILIB_MLP_BF16_XPOSE_SRC env var AND restricted to STATIC quantization
++    with a non-fp8 (bf16) hidden activation. For every other configuration this returns False,
++    so the kernel behaves byte-identically to HEAD.
++    """
++    return (
++        _MLP_BF16_XPOSE_SRC_ENABLED
++        and mlp_params.quant_params.is_quant_static()
++        and not mlpp_has_quantized_input(mlp_params)
++    )
++
++
+ #
+ # Public constants
+ 
+@@ -189,7 +223,12 @@ def build_mlp_cte_constants(
+     activation_data_type = nl.float32
+     src_proj_quant_data_type = resolve_dtype_to_nki(mlp_params.up_proj_weights_tensor.dtype)
+     down_proj_quant_data_type = resolve_dtype_to_nki(mlp_params.down_proj_weights_tensor.dtype)
+-    hidden_tile_data_type = src_proj_quant_data_type if mlpp_has_quantized_input(mlp_params) else compute_data_type
++    # The bf16-transpose-then-quantize source path keeps the persistent source activation buffer fp8
++    # (so its footprint matches the working no-knob path) even though the hidden input is bf16.
++    if mlp_cte_use_bf16_xpose_src(mlp_params):
++        hidden_tile_data_type = src_proj_quant_data_type
++    else:
++        hidden_tile_data_type = src_proj_quant_data_type if mlpp_has_quantized_input(mlp_params) else compute_data_type
+     norm_weights_bias_data_type = nl.float32
+ 
+     alloc_heap = nl.ndarray if sbm == None else sbm.alloc_heap
+diff --git a/nkilib/core/mlp/mlp_cte/mlp_cte_transpose.py b/nkilib/core/mlp/mlp_cte/mlp_cte_transpose.py
+index 4066f90..aef6072 100644
+--- a/nkilib/core/mlp/mlp_cte/mlp_cte_transpose.py
++++ b/nkilib/core/mlp/mlp_cte/mlp_cte_transpose.py
+@@ -21,11 +21,22 @@ import nki.language as nl
+ 
+ from ...utils.allocator import SbufManager
+ from ...utils.kernel_assert import kernel_assert
+-from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, get_ceil_quotient
++from ...utils.kernel_helpers import (
++    NUM_HW_PSUM_BANKS,
++    PSUM_BANK_SIZE,
++    get_ceil_quotient,
++    get_max_positive_value_for_dtype,
++)
+ from ...utils.tile_info import TiledDimInfo
+ from ...utils.tiled_range import TiledRange
+-from ..mlp_parameters import MLPParameters, mlpp_has_quantized_input, mlpp_has_quantized_weights
++from ..mlp_parameters import (
++    MLPParameters,
++    mlpp_has_quantized_input,
++    mlpp_has_quantized_weights,
++    mlpp_has_rms_normalization,
++)
+ from .mlp_cte_constants import MLPCTEConstants
++from .mlp_cte_tensor_io import _reshape_io_tensor
+ from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
+ 
+ #
+@@ -155,6 +166,394 @@ def transpose_source_tensor_tile(
+                 )
+ 
+ 
++#
++# Env-gated DMA-transpose-then-quantize source path for STATIC FP8 on gen3 (trn2).
++#
++# It produces the SAME contiguous fp8 [H, BxS] source buffer the double_row matmul reads, but the
++# transpose is performed with nisa.dma_transpose (DMA engines only). This avoids BOTH:
++#   - the gen3-broken fp8 step-2 PE-transpose interleave (the original numerical bug), and
++#   - the heavy bf16 PE-transpose PSUM-eviction scratch (scratch_sb_for_inst) that the nc_transpose
++#     approach generated and which overflowed the fused full-layer SBUF (NCC_IGCA030).
++#
++# The fp8 weights stay fp8 and the matmul stays fp8 x fp8 double_row, so the real fp8 benefit
++# (HBM-capacity reduction + throughput) is preserved -- only the activation transpose moves off the
++# PE/PSUM engines.
++#
++# It subsumes the load + RMS normalization + transpose for the source path. The bf16 activation
++# footprint stays bounded: the hidden is streamed per [128, 512] H-tile into a small reused bf16
++# load scratch plus a small reused bf16 transposed scratch ([128, H1_TILE, 128]); the persistent
++# SBUF source buffer is fp8. No PSUM and no PE-transpose are used.
++def load_normalize_transpose_quantize_source_tile_bf16(
++    mlp_params: MLPParameters,
++    tile_info: MLPCTETileInfo,
++    constants: MLPCTEConstants,
++    indices: MlpBxsIndices,
++    norm_weights_tensor_sbuf: Optional[nl.ndarray],
++    gate_up_proj_static_input_scales_sbuf: nl.ndarray,
++    output_tile_sbuf_list: list[nl.ndarray],
++    sbm: Optional[SbufManager] = None,
++):
++    """Load, RMS-normalize, transpose (bf16) and quantize (fp8) the source activation tile.
++
++    The quantization divides the (RMS-normalized, gamma-scaled) activation by gate_up_in_scale
++    before the fp8 clamp, so the matmul's (gate_w_scale * gate_up_in_scale) dequant recovers the
++    correct magnitude (the activation operand must be pre-divided by gate_up_in_scale). The output
++    buffer is the persistent fp8 source buffer read by the double_row source matmul, laid out
++    identically to the default transpose path ([H, BxS] with per-128-H-subtile blocks).
++
++    Args:
++        mlp_params: MLP configuration parameters
++        tile_info: Tiling information for the computation
++        constants: MLP CTE constants configuration
++        indices: Batch×sequence indices for tensor naming
++        norm_weights_tensor_sbuf: RMS gamma weights broadcast across partitions, or None
++        gate_up_proj_static_input_scales_sbuf: gate/up dequant input scale [128, 1]
++        output_tile_sbuf_list: Persistent fp8 source buffers (one per BxS subtile)
++        sbm: SBUF memory manager
++
++    Returns:
++        None
++
++    Notes:
++        - Only valid for STATIC quantization with a bf16 (2-byte) hidden activation -- the 2-byte
++          dtype is required by nisa.dma_transpose.
++        - Only RMS normalization (or no normalization) is supported on this path; LayerNorm and
++          fused-add are not (the caller gates this).
++        - Uses nisa.dma_transpose (DMA engines), so the source transpose allocates no PSUM and no
++          PE-transpose scratch.
++    """
++    apply_gamma = norm_weights_tensor_sbuf != None
++    apply_rms = mlpp_has_rms_normalization(mlp_params)
++
++    bxs_dim_tile = tile_info.bxs_dim_tile
++    hidden_dim_tile = tile_info.xpose_hidden_dim_tile
++    BXS_SUBTILE_COUNT = bxs_dim_tile.subtile_dim_info.tile_count
++    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
++    H_SUBTILE_SIZE = hidden_dim_tile.subtile_dim_info.tile_size
++    H_SUBTILE_COUNT = hidden_dim_tile.subtile_dim_info.tile_count
++    H_TILE_SIZE = hidden_dim_tile.tile_size
++
++    if apply_gamma:
++        kernel_assert(
++            (norm_weights_tensor_sbuf.shape[0] == nl.tile_size.pmax) and (H_SUBTILE_SIZE == nl.tile_size.pmax),
++            "Gamma tile must equal the hidden dimension subtile size and they must equal PMAX",
++        )
++
++    alloc_heap = sbm.alloc_heap if sbm else nl.ndarray
++
++    fp8_max_val = get_max_positive_value_for_dtype(constants.src_proj_quant_data_type)
++
++    # STATIC FP8 quantization scale for the activation operand.
++    #
++    # The gate/up matmul output is dequantized by (gate_w_scale * gate_up_in_scale) -- see
++    # prepare_static_scales / load_and_multiply_static_weight_scales. For that dequant to recover
++    # the true magnitude, the fp8 ACTIVATION operand fed to the matmul must be PRE-DIVIDED by
++    # gate_up_in_scale, i.e. act_fp8 = clip(act / gate_up_in_scale). The default (no-knob) path gets
++    # this because the model pre-quantizes the hidden to fp8 (act/scale) before the kernel; this
++    # knob feeds a bf16 hidden and must therefore do the division itself. Omitting it makes the
++    # activation operand ~gate_up_in_scale x too large in fp8 units, so the matmul output comes out
++    # ~gate_up_in_scale x too small -> the MLP output is effectively dead.
++    #
++    # gate_up_in_scale is a per-tensor DEQUANT scalar replicated across all 128 partitions; its
++    # reciprocal [128, 1] is the per-partition multiply applied to the transposed activation (whose
++    # partition dim is the hidden index). This mirrors qkv_cte, which multiplies the activation by
++    # in_scale_tile == reciprocal(gate_up_in_scale) before the fp8 clamp.
++    in_scale_recip_sbuf = alloc_heap(
++        (nl.tile_size.pmax, 1),
++        dtype=nl.float32,
++        name=indices.get_tensor_name("bf16_xpose_in_scale_recip"),
++    )
++    nisa.reciprocal(
++        dst=in_scale_recip_sbuf[0 : nl.tile_size.pmax, 0:1],
++        data=gate_up_proj_static_input_scales_sbuf[0 : nl.tile_size.pmax, 0:1],
++    )
++
++    # Small reused bf16 scratch holding one [BxS subtile, 512 H] tile of the hidden activation.
++    # This is the only sizeable bf16 SBUF buffer on this path (1 KB / partition). It is reused
++    # across the RMS-stats pass and the transpose/quantize pass, and -- in the stats pass -- also
++    # serves as the (discarded) element-wise destination of the squaring reduction, so NO separate
++    # [128, 512] square buffer is needed.
++    #
++    # align=32: nisa.dma_transpose reads this buffer (the transpose src) and the runtime descriptor
++    # expansion requires the transpose endpoints to start on a 32-byte boundary. Without an explicit
++    # 32B alignment the allocator can place the base at e.g. ...+8 bytes, producing a non-32B dst
++    # offset at runtime (TDRV "transpose dest offset must be 32B aligned" -> NEFF load failure).
++    bf16_hidden_scratch = alloc_heap(
++        (BXS_SUBTILE_SIZE, H_TILE_SIZE),
++        dtype=constants.compute_data_type,
++        align=32,
++        name=indices.get_tensor_name("bf16_xpose_hidden_scratch"),
++    )
++
++    # Per-row RMS reciprocal scale (one scalar per BxS row), one tile per BxS subtile.
++    rms_scale_sbuf_list = []
++    if apply_rms:
++        for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
++            rms_scale_sbuf_list.append(
++                alloc_heap(
++                    (BXS_SUBTILE_SIZE, 1),
++                    dtype=constants.activation_data_type,
++                    name=indices.get_tensor_name("bf16_xpose_rms_scale", f"subbxs{bxs_subtile_idx}"),
++                )
++            )
++
++    tensor_bxs_size = constants.get_bxs_size(mlp_params)
++    tensor_bxs_offset = constants.get_bxs_offset()
++    hidden_tensor_hbm_view = _reshape_io_tensor(constants, mlp_params.hidden_tensor)
++    H = mlp_params.hidden_size
++
++    # ---- Pass 1: stream the hidden per H-tile to compute the per-row RMS reciprocal scale ----
++    # The per-H-tile sum of squares is reduced into a tiny [128, 1] partial, then accumulated into
++    # the per-row scalar. The squaring op's required element-wise destination is written back into
++    # bf16_hidden_scratch itself (it is reloaded in pass 2 anyway), so NO separate [128, 512] square
++    # scratch is allocated.
++    if apply_rms:
++        bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
++        eps_vector = constants.epsilon_bias_vector_sbuf
++        square_partial_sbuf = alloc_heap(
++            (BXS_SUBTILE_SIZE, 1),
++            dtype=constants.activation_data_type,
++            name=indices.get_tensor_name("bf16_xpose_square_partial"),
++        )
++        for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
++            bxs_subtile_bound = bxs_dim_tile.get_subtile_bound(indices.bxs_tile_idx, bxs_subtile_idx)
++            if bxs_subtile_bound <= 0:
++                continue
++            rms_scale = rms_scale_sbuf_list[bxs_subtile_idx]
++            for hidden_tile_idx in range(hidden_dim_tile.tile_count):
++                h_offset = hidden_tile_idx * H_TILE_SIZE
++                h_size = min(H_TILE_SIZE, H - h_offset)
++                _load_bf16_hidden_htile(
++                    hidden_tensor_hbm_view,
++                    bf16_hidden_scratch,
++                    indices,
++                    bxs_dim_tile,
++                    tensor_bxs_offset,
++                    bxs_subtile_idx,
++                    bxs_subtile_bound,
++                    h_offset,
++                    h_size,
++                    H,
++                )
++                # Per-tile sum of squares over the H-tile free dim. The element-wise square output
++                # is discarded into bf16_hidden_scratch (no separate square buffer).
++                nisa.activation_reduce(
++                    dst=bf16_hidden_scratch[0:bxs_subtile_bound, 0:h_size],
++                    op=nl.square,
++                    data=bf16_hidden_scratch[0:bxs_subtile_bound, 0:h_size],
++                    reduce_op=nl.add,
++                    reduce_res=square_partial_sbuf[0:bxs_subtile_bound, 0:1],
++                    bias=bias_vector[0:bxs_subtile_bound, 0:1],
++                )
++                if hidden_tile_idx == 0:
++                    nisa.tensor_copy(
++                        dst=rms_scale[0:bxs_subtile_bound, 0:1],
++                        src=square_partial_sbuf[0:bxs_subtile_bound, 0:1],
++                        engine=nisa.vector_engine,
++                    )
++                else:
++                    nisa.tensor_tensor(
++                        dst=rms_scale[0:bxs_subtile_bound, 0:1],
++                        data1=rms_scale[0:bxs_subtile_bound, 0:1],
++                        data2=square_partial_sbuf[0:bxs_subtile_bound, 0:1],
++                        op=nl.add,
++                    )
++            # rms_scale = rsqrt(sum_sq / H + eps)
++            nisa.activation(
++                dst=rms_scale[0:bxs_subtile_bound, 0:1],
++                op=nl.rsqrt,
++                data=rms_scale[0:bxs_subtile_bound, 0:1],
++                bias=eps_vector[0:bxs_subtile_bound, 0:1],
++                scale=float(1.0 / H),
++            )
++
++    # ---- Pass 2: per H-tile, normalize, DMA-transpose (no PE/PSUM), then gamma + quantize to fp8 ----
++    # The transpose is done with nisa.dma_transpose (DMA engines only). This avoids BOTH the
++    # gen3-broken fp8 step-2 PE-transpose AND the heavy PE-transpose PSUM-eviction scratch
++    # (scratch_sb_for_inst) that the nc_transpose path generated in the fused full-layer graph.
++    #
++    # Per (BxS subtile, H-512-tile):
++    #   1. Load the bf16 hidden [BxS subtile (s), 512 (H)] into bf16_hidden_scratch (DMA).
++    #   2. Apply the per-row RMS scale BEFORE the transpose (s is the partition dim here, so the
++    #      [128, 1] rms scale is a per-partition broadcast -- cheap tensor_scalar / activation).
++    #   3. dma_transpose [s, 512]-as-[s, H1_TILE, 128] -> bf16 [H0(128), H1_TILE, s] (DMA, no PSUM).
++    #   4. Per 128-H-subtile: apply gamma (H0 on partition now -> [128, 1] per-partition scalar) and
++    #      clamp into the fp8 range, writing the contiguous [H, BxS] layout the double_row matmul
++    #      reads (identical offsets to the default transpose path).
++    H_SUBTILE_PER_TILE = H_SUBTILE_COUNT  # 512 / 128 == number of 128-H-subtiles per H-tile
++    bias_vector = constants.bxs_dim_subtile_zero_bias_vector_sbuf
++
++    # nisa.dma_transpose destination 32-byte alignment proof (the runtime enforces this; the
++    # compiler does not). Every dma_transpose dst byte-offset = base_addr + AP_offset, and the AP
++    # offset is 0 (we transpose into the start of bf16_transposed_scratch each time). So we only
++    # need: (a) the buffer base 32B-aligned -> align=32 below; (b) the dst AP's element strides are
++    # multiples of 16 bf16 elements (= 32 bytes) so no interior write lands off a 32B boundary.
++    #   partition stride = H_SUBTILE_PER_TILE * BXS_SUBTILE_SIZE  (= 4 * 128 = 512, % 16 == 0)
++    #   H1-subtile stride = BXS_SUBTILE_SIZE                      (= 128,       % 16 == 0)
++    #   inner (BxS) stride = 1, width = BXS_SUBTILE_SIZE          (= 128,       % 16 == 0)
++    # All strides are multiples of 16 bf16 elements; with the 32B-aligned base, every transposed
++    # element offset (in bytes) is a multiple of 32. BXS_SUBTILE_SIZE is pmax (128) at the Devstral
++    # dims, so the assertion below holds; we assert it to fail loudly if a future config breaks it.
++    kernel_assert(
++        (BXS_SUBTILE_SIZE % 16 == 0) and ((H_SUBTILE_PER_TILE * BXS_SUBTILE_SIZE) % 16 == 0),
++        "dma_transpose dst strides must be multiples of 16 bf16 elements (32 bytes) for the "
++        "runtime descriptor expansion; got BXS_SUBTILE_SIZE="
++        f"{BXS_SUBTILE_SIZE}, H_SUBTILE_PER_TILE={H_SUBTILE_PER_TILE}",
++    )
++
++    # Small bounded bf16 transposed scratch for ONE H-512-tile: [H0(128), H1_TILE, BxS subtile].
++    # align=32: the dma_transpose destination must begin on a 32-byte boundary (see proof above).
++    bf16_transposed_scratch = alloc_heap(
++        (nl.tile_size.pmax, H_SUBTILE_PER_TILE, BXS_SUBTILE_SIZE),
++        dtype=constants.compute_data_type,
++        align=32,
++        name=indices.get_tensor_name("bf16_xpose_transposed_scratch"),
++    )
++
++    for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
++        bxs_subtile_bound = bxs_dim_tile.get_subtile_bound(indices.bxs_tile_idx, bxs_subtile_idx)
++        if bxs_subtile_bound <= 0:
++            continue
++        output_tile_sbuf = output_tile_sbuf_list[bxs_subtile_idx]
++        rms_scale = rms_scale_sbuf_list[bxs_subtile_idx] if apply_rms else None
++
++        for hidden_tile_idx in range(hidden_dim_tile.tile_count):
++            h_offset = hidden_tile_idx * H_TILE_SIZE
++            h_tile_size = min(H_TILE_SIZE, H - h_offset)
++            # MLP requires H to be a multiple of 128; H-tiles are 512-wide (also a multiple of 128).
++            num_h_subtiles = get_ceil_quotient(h_tile_size, H_SUBTILE_SIZE)
++
++            # 1. Load the bf16 hidden [BxS subtile, H tile] into the reused scratch.
++            _load_bf16_hidden_htile(
++                hidden_tensor_hbm_view,
++                bf16_hidden_scratch,
++                indices,
++                bxs_dim_tile,
++                tensor_bxs_offset,
++                bxs_subtile_idx,
++                bxs_subtile_bound,
++                h_offset,
++                h_tile_size,
++                H,
++            )
++
++            # 2. Apply the per-row RMS scale (per-partition, s on partition) BEFORE the transpose.
++            if apply_rms:
++                nisa.activation(
++                    dst=bf16_hidden_scratch[0:bxs_subtile_bound, 0:h_tile_size],
++                    op=nl.copy,
++                    data=bf16_hidden_scratch[0:bxs_subtile_bound, 0:h_tile_size],
++                    scale=rms_scale[0:bxs_subtile_bound, 0:1],
++                    bias=bias_vector[0:bxs_subtile_bound, 0:1],
++                )
++
++            # 3. DMA-transpose [BxS subtile, num_h_subtiles, 128] -> bf16 [H0(128), num_h_subtiles, BxS subtile].
++            #    4D src/dst (permutation [3, 1, 2, 0] swaps the BxS and H0 axes, keeping the H1 axis).
++            src_view = bf16_hidden_scratch.reshape(
++                (BXS_SUBTILE_SIZE, H_SUBTILE_PER_TILE, H_SUBTILE_SIZE)
++            ).ap(
++                pattern=[
++                    [H_SUBTILE_PER_TILE * H_SUBTILE_SIZE, bxs_subtile_bound],
++                    [H_SUBTILE_SIZE, num_h_subtiles],
++                    [1, 1],
++                    [1, H_SUBTILE_SIZE],
++                ],
++                offset=0,
++            )
++            dst_view = bf16_transposed_scratch.ap(
++                pattern=[
++                    [H_SUBTILE_PER_TILE * BXS_SUBTILE_SIZE, H_SUBTILE_SIZE],
++                    [BXS_SUBTILE_SIZE, num_h_subtiles],
++                    [1, 1],
++                    [1, bxs_subtile_bound],
++                ],
++                offset=0,
++            )
++            nisa.dma_transpose(dst=dst_view, src=src_view)
++
++            # 4. Per 128-H-subtile: gamma (H0 on partition) + clamp into fp8 range, written to the
++            #    same contiguous [H, BxS] offsets the default transpose path uses.
++            for h_subtile_idx in range(num_h_subtiles):
++                gamma_col = hidden_tile_idx * H_SUBTILE_COUNT + h_subtile_idx
++                dst_fp8 = output_tile_sbuf[
++                    0:nl.tile_size.pmax,
++                    hidden_dim_tile.get_subtile_indices(hidden_tile_idx, h_subtile_idx, bxs_subtile_bound),
++                ]
++                transposed_block = bf16_transposed_scratch[0:nl.tile_size.pmax, h_subtile_idx, 0:bxs_subtile_bound]
++                if apply_gamma:
++                    # transposed * gamma * (1 / gate_up_in_scale), then clamp into the fp8 range.
++                    nisa.tensor_scalar(
++                        dst=dst_fp8,
++                        data=transposed_block,
++                        op0=nl.multiply,
++                        operand0=norm_weights_tensor_sbuf[0:nl.tile_size.pmax, nl.ds(gamma_col, 1)],
++                        op1=nl.multiply,
++                        operand1=in_scale_recip_sbuf[0:nl.tile_size.pmax, 0:1],
++                    )
++                    nisa.tensor_scalar(
++                        dst=dst_fp8,
++                        data=dst_fp8,
++                        op0=nl.minimum,
++                        operand0=fp8_max_val,
++                        op1=nl.maximum,
++                        operand1=-fp8_max_val,
++                    )
++                else:
++                    # transposed * (1 / gate_up_in_scale), then clamp into the fp8 range.
++                    nisa.tensor_scalar(
++                        dst=dst_fp8,
++                        data=transposed_block,
++                        op0=nl.multiply,
++                        operand0=in_scale_recip_sbuf[0:nl.tile_size.pmax, 0:1],
++                        op1=nl.minimum,
++                        operand1=fp8_max_val,
++                    )
++                    nisa.tensor_scalar(
++                        dst=dst_fp8,
++                        data=dst_fp8,
++                        op0=nl.maximum,
++                        operand0=-fp8_max_val,
++                    )
++
++    # Free the scratch buffers allocated on this path (heap LIFO: reverse of allocation).
++    if sbm != None:
++        sbm.pop_heap()  # bf16_transposed_scratch
++        if apply_rms:
++            sbm.pop_heap()  # square_partial_sbuf
++            for _ in range(BXS_SUBTILE_COUNT):
++                sbm.pop_heap()  # rms_scale_sbuf_list
++        sbm.pop_heap()  # bf16_hidden_scratch
++        sbm.pop_heap()  # in_scale_recip_sbuf
++
++
++def _load_bf16_hidden_htile(
++    hidden_tensor_hbm_view: nl.ndarray,
++    bf16_hidden_scratch: nl.ndarray,
++    indices: MlpBxsIndices,
++    bxs_dim_tile,
++    tensor_bxs_offset: int,
++    bxs_subtile_idx: int,
++    bxs_subtile_bound: int,
++    h_offset: int,
++    h_size: int,
++    H: int,
++):
++    """Load a single [BxS subtile, H-tile] block of the bf16 hidden activation from HBM."""
++    bxs_offset = bxs_dim_tile.get_subtile_start(indices.bxs_tile_idx, bxs_subtile_idx) + tensor_bxs_offset
++    hidden_tensor_offset = (
++        indices.batch_idx * hidden_tensor_hbm_view.shape[1] * hidden_tensor_hbm_view.shape[2]
++        + bxs_offset * hidden_tensor_hbm_view.shape[2]
++        + h_offset
++    )
++    nisa.dma_copy(
++        dst=bf16_hidden_scratch[0:bxs_subtile_bound, 0:h_size],
++        src=hidden_tensor_hbm_view.ap(
++            [[hidden_tensor_hbm_view.shape[2], bxs_subtile_bound], [1, h_size]],
++            offset=hidden_tensor_offset,
++        ),
++    )
++
++
+ #
+ # Transpose the intermediate tensor tile in SBUF
+ def transpose_intermediate_tensor_tile(
+diff --git a/nkilib/core/qkv/qkv_cte.py b/nkilib/core/qkv/qkv_cte.py
+index ea20ddc..6c4e8ec 100644
+--- a/nkilib/core/qkv/qkv_cte.py
++++ b/nkilib/core/qkv/qkv_cte.py
+@@ -4305,7 +4305,17 @@ def _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(
+             pre_buffer_tile_space_per_partition += dims.H * sizeinbytes(cfg.compute_mm_dtype)
+ 
+     # 'output_sb [nl.tile_size.pmax, I]'
+-    pre_buffer_tile_space_per_partition += dims.I * sizeinbytes(cfg.compute_mm_dtype)
++    # NOTE: output_sb is allocated as bf16 in the STATIC path (see _qkv_cte_impl,
++    # output_dtype = nl.bfloat16) while compute_mm_dtype is fp8 (1 byte) for STATIC.
++    # Budgeting it with compute_mm_dtype under-counts each multi-buffered output tile
++    # by dims.I bytes, which lets the lookahead pick too high a multi-buffer degree and
++    # overflows SBUF at larger prefill buckets (e.g. 2048). Use the real output dtype.
++    output_sb_dtype = (
++        nl.bfloat16
++        if cfg.quantization_config.quantization_type == QuantizationType.STATIC
++        else cfg.compute_mm_dtype
++    )
++    pre_buffer_tile_space_per_partition += dims.I * sizeinbytes(output_sb_dtype)
+ 
+     if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.RMS_NORM_SKIP_GAMMA:
+         pre_buffer_tile_space_per_partition += 1 * sizeinbytes(cfg.act_dtype)  # 'square_sum_sb [nl.tile_size.pmax, 1]'

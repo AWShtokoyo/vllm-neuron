@@ -1,0 +1,143 @@
+--- a/vllm_neuron/__init__.py
++++ b/vllm_neuron/__init__.py
+@@ -218,10 +218,48 @@ def register():
+     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
+ 
+     _patch_dcp_config_validation()
++    _register_ministral3_hf_config()
+ 
+     return get_platform_class()
+ 
+ 
++# Module-level handle for the Ministral3 HF config class (bound lazily inside
++# _register_ministral3_hf_config). Kept at module scope so instances are
++# picklable across engine-core subprocesses under data_parallel_size>1.
++_Ministral3HFConfig = None
++
++
++def _register_ministral3_hf_config() -> None:
++    """Register the Ministral3 model_type with HuggingFace AutoConfig.
++
++    Ministral3 (e.g. Devstral-2-123B-Instruct-2512) targets transformers 5.x and
++    is not in the installed transformers' CONFIG_MAPPING, so vLLM's
++    AutoConfig.from_pretrained() would raise KeyError('ministral3'). We register a
++    minimal PretrainedConfig subclass that simply absorbs all fields from the HF
++    config dict (the Neuron model reads them via Ministral3Config.from_configs).
++    """
++    from transformers import AutoConfig, PretrainedConfig
++    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
++
++    global _Ministral3HFConfig
++    if _Ministral3HFConfig is None:
++        class _Ministral3HFConfig(PretrainedConfig):  # noqa: F811
++            model_type = "ministral3"
++
++        # Make the class picklable: with data_parallel_size>1 vLLM spawns
++        # engine-core subprocesses and pickles the HF config across the process
++        # boundary. A function-local class has qualname
++        # "_register_ministral3_hf_config.<locals>._Ministral3HFConfig", which
++        # pickle cannot resolve. Bind it to a module-level name so pickle finds
++        # it as vllm_neuron._Ministral3HFConfig (TP-only never crosses the
++        # boundary, which is why this only surfaces under DP).
++        _Ministral3HFConfig.__qualname__ = "_Ministral3HFConfig"
++        _Ministral3HFConfig.__module__ = __name__
++
++    if "ministral3" not in CONFIG_MAPPING:
++        AutoConfig.register("ministral3", _Ministral3HFConfig)
++
++
+ def __getattr__(name):
+     import importlib
+ 
+--- a/vllm_neuron/model/__init__.py
++++ b/vllm_neuron/model/__init__.py
+@@ -3,6 +3,6 @@ import importlib as _importlib
+ 
+ 
+ def __getattr__(name):
+-    if name in ("llama3", "gpt_oss"):
++    if name in ("llama3", "gpt_oss", "ministral3"):
+         return _importlib.import_module(f".{name}", __name__)
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+--- a/vllm_neuron/model/registry.py
++++ b/vllm_neuron/model/registry.py
+@@ -5,6 +5,7 @@ from .llama3 import LlamaForCausalLM
+ from .gpt_oss import GptOssForCausalLM
+ from .llama3 import Eagle3LlamaForCausalLM
+ from .qwen3_vl import Qwen3VLForConditionalGeneration
++from .ministral3 import Ministral3ForCausalLM
+ 
+ 
+ def get_models() -> list[tuple[str, type]]:
+@@ -21,6 +22,7 @@ def get_models() -> list[tuple[str, type]]:
+         ("GptOssForCausalLM", GptOssForCausalLM),
+         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
+         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
++        ("Ministral3ForCausalLM", Ministral3ForCausalLM),
+     ]
+ 
+     # SyntheticNeuronModel is a testing-only model that replaces real neural
+--- a/vllm_neuron/vllm/platform.py
++++ b/vllm_neuron/vllm/platform.py
+@@ -153,14 +153,59 @@ class NeuronPlatform(Platform):
+         """Register Neuron model architectures before ModelConfig validation."""
+         import os
+ 
+-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+-            from vllm.model_executor.models.registry import ModelRegistry
++        from vllm.model_executor.models.registry import ModelRegistry
+ 
++        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+             ModelRegistry.register_model(
+                 "SyntheticNeuronModel",
+                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
+             )
+ 
++        # Pre-register Ministral3 with a pre-built _ModelInfo so
++        # is_text_generation_model=True is set without a subprocess inspection
++        # (which would fail on vllm.config circular imports at plugin load time).
++        # The neuron_worker later re-registers the real impl class (same pattern
++        # as GptOssForCausalLM).
++        from vllm.model_executor.models.registry import (
++            _ModelInfo,
++            _RegisteredModel,
++        )
++
++        _common_info = dict(
++            is_text_generation_model=True,
++            is_pooling_model=False,
++            attn_type="decoder",
++            default_seq_pooling_type="LAST",
++            default_tok_pooling_type="ALL",
++            score_type="bi-encoder",
++            supports_multimodal=False,
++            supports_multimodal_raw_input_only=False,
++            requires_raw_input_tokens=False,
++            supports_multimodal_encoder_tp_data=False,
++            supports_pp=False,
++            has_inner_state=False,
++            is_attention_free=False,
++            is_hybrid=False,
++            has_noops=False,
++            supports_mamba_prefix_caching=False,
++            supports_transcription=False,
++            supports_transcription_only=False,
++        )
++        _ministral3_model_info = _ModelInfo(
++            architecture="Ministral3ForCausalLM", **_common_info
++        )
++
++        import torch.nn as nn
++
++        class _Ministral3Placeholder(nn.Module):
++            pass
++
++        if "Ministral3ForCausalLM" not in ModelRegistry.models:
++            ModelRegistry.models["Ministral3ForCausalLM"] = _RegisteredModel(
++                interfaces=_ministral3_model_info,
++                model_cls=_Ministral3Placeholder,
++            )
++
+     @classmethod
+     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+         """Default block_size to 32 for Neuron when the user didn't override."""
