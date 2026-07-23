@@ -33,6 +33,13 @@ Measure TTFT improvement from prefix caching with GPT-OSS.
 Serve the multimodal Qwen3-VL-32B model.
 :::
 
+:::{grid-item-card} Deploy Qwen3.6-35B-A3B
+:link: tutorial-qwen3-6-moe
+:link-type: doc
+
+Serve the text-only Qwen3.6-35B-A3B hybrid MoE model.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Disaggregated inference (1P1D and xPyD) <tutorial-di-1p1d-xpyd>
 Deploying gpt-oss <tutorial-gpt-oss>
 Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmarking>
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
+Deploying Qwen3.6-35B-A3B <tutorial-qwen3-6-moe>
 :::

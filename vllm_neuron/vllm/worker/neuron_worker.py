@@ -861,10 +861,101 @@ class NeuronWorker(WorkerBase):
         """
         gpu_mem_util = self.cache_config.gpu_memory_utilization
         if envs.VLLM_NEURON_CPU_COMPILE:
-            return self._estimate_available_memory_neuron(gpu_mem_util)
-        if envs.VLLM_NEURON_CPU_MODE:
-            return self._determine_available_memory_cpu(gpu_mem_util)
-        return self._determine_available_memory_neuron(gpu_mem_util)
+            avail = self._estimate_available_memory_neuron(gpu_mem_util)
+        elif envs.VLLM_NEURON_CPU_MODE:
+            avail = self._determine_available_memory_cpu(gpu_mem_util)
+        else:
+            avail = self._determine_available_memory_neuron(gpu_mem_util)
+        return self._cap_kv_budget_for_unified_cache(avail)
+
+    def _cap_kv_budget_for_unified_cache(self, avail_bytes: int) -> int:
+        """Cap the KV budget so the shared unified slab stays within the .ap
+        indirect-DMA addressing limits.
+
+        Under VLLM_UNIFIED_KV_GATHER the full-attn KV and GDN state share ONE raw
+        slab, read/written by .ap indirect DMA (functional/paged_kv_gather.py).
+
+        HISTORY: the ORIGINAL bound was the 32-bit ELEMENT index — the kernels
+        formed a flat `block*page_stride + intra` int32 offset that overflowed at
+        num_blocks*page_elems >= 2**31 ("dst_indirect_max_index exceeds 32-bit
+        range"), forcing num_blocks <= 16383 (~4 GiB) and HALVING usable KV. Both
+        kernels were rewritten BLOCK-INDEXED (block base on the wide indirect axis,
+        intra-page column as a small static offset), device-proven to read/write
+        correctly at num_blocks=17000 (base offset 2.228e9 > 2**31). So the element
+        bound no longer applies.
+
+        REMAINING bound (device-discovered): the .ap indirect DIM's row count. The
+        gather (read) resolves element addresses PAST 2**32 (device-verified block
+        39999, base 5.24e9). The WRITE is an indirect SCATTER; on trn2 HWDGE has no
+        indirect scatter, so SWDGE (uint32-addressed) is the only path and the
+        resolved element address is hardware-capped at 2**32. Device-measured: write
+        PASS to block 32767 (base 4.29e9, V-end exactly 2**32), FAIL at 32768. So the
+        binding limit is now the SCATTER 2**32-element ceiling on the slab:
+            num_blocks * page_elems <= 2**32   ->   32768 blocks / 8 GiB
+        which is 2x the old int32 element cap (2**31 -> 16384 / 4 GiB). Full
+        write->gather round-trip PROVEN at num_blocks=32768. To address >8 GiB in one
+        slab would require host-side slab-sharding (per-request base pointer within a
+        <=2**32 window) — a separate change, not a kernel one. No-op unless unified
+        path on + hybrid model. See functional/paged_kv_gather.py.
+        """
+        import os as _os
+        if not (_os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1"
+                or _os.environ.get("VLLM_KV_GATHER_KERNEL") == "1"):
+            return avail_bytes
+        try:
+            kv_spec = self.get_kv_cache_spec()
+        except Exception:
+            return avail_bytes
+        # Find the largest page_size among groups (the shared slab uses the uniform
+        # / max page), the full-attn KV element size, and whether a Mamba group exists.
+        from vllm.v1.kv_cache_interface import (
+            MambaSpec, FullAttentionSpec, SlidingWindowSpec,
+        )
+        import torch as _torch
+        page_bytes = 0
+        is_hybrid = False
+        dtype_elem = None  # derive from the full-attn KV dtype (NOT hardcoded — fp8/fp32 differ)
+        for spec in kv_spec.values():
+            pb = getattr(spec, "page_size_bytes", 0) or 0
+            page_bytes = max(page_bytes, pb)
+            if isinstance(spec, MambaSpec):
+                is_hybrid = True
+            if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+                _dt = getattr(spec, "dtype", None)
+                if _dt is not None:
+                    dtype_elem = _torch.empty(0, dtype=_dt).element_size()
+        if not is_hybrid or page_bytes <= 0:
+            return avail_bytes
+        if dtype_elem is None:
+            dtype_elem = 2  # no full-attn spec found; fall back to bf16 (shouldn't happen for hybrid)
+        # The .ap index is an ELEMENT index in the SLAB's element size. The slab is int8-backed but
+        # addressed per-component in that component's dtype; the tightest bound is the SMALLEST
+        # element size present (more elements per page). Use the KV dtype (the full-attn region that
+        # drives paged_kv_write/gather). page_elems = page_bytes // dtype_elem.
+        page_elems = page_bytes // dtype_elem
+        if page_elems <= 0:
+            return avail_bytes
+        # SCATTER-DGE 2**32-ELEMENT bound (device-measured, 2026-07-09). Both kernels were rewritten
+        # block-indexed and validated: the GATHER (read) resolves element addresses past 2**32; the
+        # WRITE (indirect SCATTER) resolves in UINT32 and is hardware-capped at 2**32 elements. On
+        # trn2 HWDGE has no indirect gather/scatter, so SWDGE (uint32) is the only scatter path — no
+        # kernel restructure exceeds 2**32 (verified: write PASS to block 32767 / base 4.29e9, FAIL
+        # at 32768 / >2**32). So the slab (which the write must address) is bound by:
+        #     num_blocks * page_elems <= 2**32
+        # This is 2x the OLD int32 bound (2**31): 32768 blocks / 8 GiB vs the old 16384 / 4 GiB.
+        # Round-trip PROVEN at num_blocks=32768 (V-region-end exactly 2**32). To exceed 8 GiB in one
+        # slab would require host-side slab-sharding (per-request base pointer) — a separate change;
+        # 8 GiB doubles unified KV vs the old cap and clears the KV portion of the 396K-hotfix compare.
+        max_blocks = (2**32) // page_elems
+        max_bytes = max_blocks * page_bytes
+        if avail_bytes > max_bytes:
+            logger.warning(
+                "Unified KV cache: capping KV budget %.2f GiB -> %.2f GiB (num_blocks <= %d, "
+                "page_elems=%d) — scatter-DGE 2**32-element (uint32) hardware ceiling on the WRITE. "
+                "2x the old int32 cap; >8 GiB in one slab needs host-side slab-sharding.",
+                avail_bytes / 2**30, max_bytes / 2**30, max_blocks, page_elems)
+            return max_bytes
+        return avail_bytes
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """
