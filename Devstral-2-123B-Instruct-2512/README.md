@@ -18,6 +18,44 @@ supporting artifacts that do not belong in the framework package:
 | `integration.patch` | The framework-side edits that register the model (already applied in this fork; kept as a portable patch for a pristine `vllm-neuron 0.21.0.1.0.0` install) |
 | `integration_nkilib.patch` | **`nkilib` kernel** patch that enables the **FP8-native** path — a *separate package* from `vllm-neuron`, so it cannot live in this tree |
 
+## Files added / modified
+
+The port touches the following paths across the repository (relative to the
+repo root). The model is integrated in-tree, so most of these are committed
+directly on this branch; the `Devstral-2-123B-Instruct-2512/` bundle above is
+supplementary.
+
+**New — model package** (`vllm_neuron/model/ministral3/`)
+
+| Path | Purpose |
+|---|---|
+| `model.py` | Ministral3 (Devstral) dense-GQA causal LM |
+| `config.py` | `Ministral3Config` — builds the Neuron config from the HF config |
+| `factory.py` | model construction / weight-loading factory |
+| `weight_loaders.py` | per-tensor static FP8 (E4M3) + BF16-dequant weight loaders |
+| `__init__.py` | package exports |
+
+**New — docs, example, bundle**
+
+| Path | Purpose |
+|---|---|
+| `docs/model-recipes/devstral-2-123b.md` | model recipe / card |
+| `docs/tutorials/tutorial-devstral-2-123b.md` | deployment tutorial |
+| `examples/vllm_neuron/models/ministral3/run.py` | offline generation example |
+| `Devstral-2-123B-Instruct-2512/` | this artifact bundle (README, `integration.patch`, `integration_nkilib.patch`, `test/integration/`) |
+
+**Modified — shared framework touch-points**
+
+| Path | Change |
+|---|---|
+| `vllm_neuron/model/registry.py` | register `Ministral3ForCausalLM` |
+| `vllm_neuron/model/__init__.py` | add `ministral3` to the lazy-import allowlist |
+| `vllm_neuron/__init__.py` | register the `ministral3` HuggingFace `AutoConfig` (picklable for `data_parallel_size>1`) |
+| `vllm_neuron/vllm/platform.py` | pre-register Ministral3 with a pre-built `_ModelInfo` (`is_text_generation_model=True`) at plugin load |
+| `README.md` | add Devstral-2-123B to the Contributed Models list |
+| `docs/model-recipes/index.md` | link the model recipe |
+| `docs/tutorials/index.md` | link the tutorial |
+
 ## Documentation
 
 Full deployment guidance lives in the repository docs:
