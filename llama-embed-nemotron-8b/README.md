@@ -22,6 +22,45 @@ apply anything to use it:
 - **Deployment tutorial:** [`docs/tutorials/tutorial-llama-embed-nemotron-8b.md`](../docs/tutorials/tutorial-llama-embed-nemotron-8b.md)
 - **Offline example:** [`examples/vllm_neuron/models/llama_bidirec/run.py`](../examples/vllm_neuron/models/llama_bidirec/run.py)
 
+## Files added / modified
+
+The port touches the following paths across the repository (relative to the
+repo root). The model is integrated in-tree, so most of these are committed
+directly on this branch; the `llama-embed-nemotron-8b/` bundle below is
+supplementary.
+
+**New — model package** (`vllm_neuron/model/llama_bidirec/`)
+
+| Path | Purpose |
+|---|---|
+| `model.py` | bidirectional Llama backbone + mask-weighted mean-pool + L2-norm → 4096-dim embedding |
+| `config.py` | `LlamaBidirectional` config (pooling / temperature fields) |
+| `factory.py` | model construction / weight-loading factory |
+| `__init__.py` | package exports |
+
+**New — docs, example, bundle**
+
+| Path | Purpose |
+|---|---|
+| `docs/model-recipes/llama-embed-nemotron-8b.md` | model recipe / card |
+| `docs/tutorials/tutorial-llama-embed-nemotron-8b.md` | deployment tutorial |
+| `examples/vllm_neuron/models/llama_bidirec/run.py` | offline embedding example |
+| `llama-embed-nemotron-8b/` | this artifact bundle (README, `integration.patch`, `test/`) |
+
+**Modified — shared framework touch-points**
+
+| Path | Change |
+|---|---|
+| `vllm_neuron/model/registry.py` | register `LlamaBidirectionalModel` |
+| `vllm_neuron/__init__.py` | register the `llama_bidirec` HuggingFace `AutoConfig` |
+| `vllm_neuron/vllm/core/scheduler.py` | pooling multi-sequence prefill packing (`VLLM_NEURON_POOLING_PACK`, default on) |
+| `vllm_neuron/vllm/worker/neuron_model_runner.py` | pooling runner mode + dense multi-seq prefill layout |
+| `vllm_neuron/vllm/worker/neuron_worker.py` | skip decode graph extraction + warmup for prefill-only pooling models |
+| `vllm_neuron/functional/attention/attention_cte.py` | route non-causal (bidirectional) attention through the PyTorch fallback (nkilib non-causal kernel corrupts the heap) |
+| `vllm_neuron/compile/backend.py` | opt-in `VLLM_NEURON_FORCE_LNC1` single-core codegen for all-PyTorch graphs |
+| `docs/model-recipes/index.md` | link the model recipe |
+| `docs/tutorials/index.md` | link the tutorial |
+
 ## Contents of this bundle
 
 | Path | Purpose |
