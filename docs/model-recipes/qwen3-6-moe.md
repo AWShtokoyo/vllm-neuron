@@ -110,16 +110,21 @@ batch size 8.
 Per-request decode is approximately 21 tok/s at batch size 1, with a flat
 time-per-output-token of roughly 55 ms across batch sizes 1, 4, and 8.
 
-> **Multi-batch serving: use `max_model_len=1024` with `kv_segment_size=512`.**
-> This is the verified multi-batch recipe (batch sizes 4 and 8 both run cleanly).
-> Do **not** run batch size > 1 with `max_model_len=512`: the tight single
-> bucket makes each request reserve its full worst-case KV allocation, so the
-> hybrid (attention + GatedDeltaNet) unified block pool saturates at ~3
-> concurrent decodes. A fourth request then cannot be admitted and cannot
-> preempt, and once a running decode crosses the 256-token attention block
-> boundary the scheduler returns empty batches indefinitely (an admission-control
-> limitation for the hybrid pool, tracked separately). `max_model_len=512` is
-> fine for batch size 1.
+> **Multi-batch serving: use `max_model_len=1024` with `kv_segment_size=512`** for
+> best throughput. This is the recommended multi-batch recipe (batch sizes 4 and 8
+> both run cleanly with low KV utilization).
+>
+> A tight `max_model_len=512` makes each request reserve its full worst-case KV
+> allocation up front, so the hybrid (attention + GatedDeltaNet) unified block pool
+> can saturate at only ~3 concurrent decodes. The scheduler now handles this with a
+> pool-aware admission gate: it predicts each incoming prefill's worst-case block
+> footprint against the free pool and defers admission when the pool is full,
+> instead of hiding running decodes to make room (which previously dead-ended into
+> empty batches). Batch size > 1 at `max_model_len=512` therefore runs correctly —
+> the gate simply throttles concurrency to what the pool can hold. The gate is a
+> no-op when the pool has room, so it does not affect the `max_model_len=1024`
+> recipe. It can be disabled with `VLLM_NEURON_POOL_ADMISSION_GATE=0` (not
+> recommended for hybrid models with a tight `max_model_len`).
 
 > Use `vllm bench serve` (online) for batch sizes greater than 1. Any change to
 > the segmentation, sequence-length, or bucket configuration changes the traced

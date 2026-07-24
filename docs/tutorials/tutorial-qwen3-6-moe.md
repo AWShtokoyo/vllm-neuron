@@ -120,9 +120,11 @@ print(response.choices[0].message.content)
 
 For higher throughput, keep `--max-model-len 1024` (with `kv_segment_size_buckets:
 [512]` as above) and serve with a larger batch — for example `--max-num-seqs 8
---num-seqs-buckets 8` — then drive load with `vllm bench serve`. Do not drop
-`--max-model-len` to 512 for batch size > 1; see the
-[model recipe](../model-recipes/qwen3-6-moe.md#performance) for the reason and for
+--num-seqs-buckets 8` — then drive load with `vllm bench serve`. A tight
+`--max-model-len 512` with batch size > 1 also runs correctly: the scheduler's
+pool-aware admission gate throttles concurrency to what the hybrid block pool can
+hold rather than stalling. See the
+[model recipe](../model-recipes/qwen3-6-moe.md#performance) for the details and for
 measured throughput at batch sizes 1, 4, and 8.
 
 ## Step 4: Offline Inference

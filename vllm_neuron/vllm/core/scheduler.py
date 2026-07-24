@@ -154,6 +154,7 @@ class NeuronScheduler(Scheduler):
         # Current scheduler state (updated after each schedule() call)
         self._state: SchedulerState = SchedulerState.IDLE
         self._kv_exhaustion_warned: bool = False
+        self._pool_exhaustion_warned: bool = False
 
         # Get configuration from neuron_config
         neuron_config = vllm_config.additional_config.get("neuron_config", {})
@@ -579,7 +580,88 @@ class NeuronScheduler(Scheduler):
                 )
             return False
 
+        # Prevent the hybrid-pool livelock: the count-based `_max_kv_concurrent`
+        # guard above bounds the NUMBER of running requests, but is blind to the
+        # actual per-request block footprint of the shared KV pool. For a hybrid
+        # (full-attention + GatedDeltaNet) model the GDN mamba page dominates, so
+        # at small max_model_len only a handful of requests fit even though
+        # `_max_kv_concurrent` is large (device: 3 decodes hold ~803 blocks each
+        # of a 2713-block pool -> free=303, yet _max_kv_concurrent=542). Admitting
+        # a 4th request there makes schedule() Step 3.2 hide all running decodes
+        # for a prefill the base scheduler then cannot allocate (pool saturated)
+        # and cannot preempt (decodes hidden) -> zero-token batch every step ->
+        # livelock. Defer instead so decodes keep running, free blocks, and the
+        # prefill is admitted once one completes.
+        if not self._pool_admission_ok(request):
+            return False
+
         return True
+
+    def _pool_admission_ok(self, request: "Request") -> bool:
+        """Whether admitting ``request`` fits the free KV block pool (worst case).
+
+        Predicts the request's worst-case (full-sequence, no prefix reuse) block
+        requirement with the KV manager's own coordinator predictor — the exact
+        computation ``allocate_slots(full_sequence_must_fit=True)`` performs — and
+        returns ``False`` if it would not fit in the currently free blocks. This
+        is the physically correct admission condition for the hybrid unified pool,
+        of which the token-based ``_max_kv_concurrent`` count is only a proxy that
+        ignores the mamba/GatedDeltaNet page footprint.
+
+        Strictly additive and fail-open: it can only DEFER admission (return
+        False), never grant it, and any predictor error reverts to the prior
+        behavior (no deferral from this check). Disable with
+        ``VLLM_NEURON_POOL_ADMISSION_GATE=0`` (default on) — kept as an A/B
+        kill-switch for the device livelock counter-test.
+        """
+        import os
+
+        if os.environ.get("VLLM_NEURON_POOL_ADMISSION_GATE", "1") != "1":
+            return True
+        try:
+            km = self.kv_cache_manager
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            # Worst case: no prefix-cache reuse, request not yet registered.
+            # Both the full-attention and (non-align) mamba managers read
+            # req_to_blocks via .get(id, ()), so this is safe & side-effect-free
+            # for an unadmitted request.
+            need = km.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=km.empty_kv_cache_blocks.blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=0,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+            )
+            free = km.block_pool.get_num_free_blocks()
+            if need > free:
+                if not self._pool_exhaustion_warned:
+                    logger.warning(
+                        "Prefill deferred (hybrid pool): request needs %d KV "
+                        "blocks worst-case but only %d free (%d running). "
+                        "Waiting for a decode to complete. This bounds "
+                        "concurrency by the real per-request block footprint "
+                        "(mamba/GDN page), which the token-based concurrency "
+                        "cap does not capture.",
+                        need,
+                        free,
+                        len(self.running),
+                    )
+                    self._pool_exhaustion_warned = True
+                else:
+                    logger.debug(
+                        "Prefill deferred (hybrid pool): need %d > free %d.",
+                        need,
+                        free,
+                    )
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 - gate must never break scheduling
+            logger.debug(
+                "Pool admission predictor failed (%s); skipping pool gate.", exc
+            )
+            return True
 
     def _should_skip_prefilling_padding_in_di(
         self, scheduler_output: "SchedulerOutput", req_id: str
@@ -782,6 +864,92 @@ class NeuronScheduler(Scheduler):
 
         return scheduler_output
 
+    def _log_empty_batch_diag(
+        self, scheduler_output: "SchedulerOutput", running_holdback: list
+    ) -> None:
+        """Log the cause of an empty schedule() step (diagnostic, default-OFF).
+
+        Enabled only under VLLM_NEURON_SCHED_DIAG=1. Fires when the base
+        scheduler scheduled zero tokens while there are unfinished requests
+        (running or hidden) — i.e. the livelock signature. Reports the real free
+        block count and each unfinished request's prefill/decode progress so the
+        empty-batch mechanism can be identified from a single device run. Pure
+        observation: no state is mutated.
+        """
+        import os
+
+        if os.environ.get("VLLM_NEURON_SCHED_DIAG") != "1":
+            return
+        try:
+            total_tok = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+            if total_tok is None:
+                total_tok = sum(scheduler_output.num_scheduled_tokens.values())
+            # visible running (self.running) + hidden decodes (running_holdback)
+            live = list(self.running) + list(running_holdback)
+            n_unfinished = len(live) + len(self.holdback_queue) + len(self.waiting)
+            if total_tok > 0 or n_unfinished == 0:
+                return  # not an empty-batch-with-work step
+
+            free_blocks = None
+            total_blocks = None
+            usage = None
+            try:
+                bp = self.kv_cache_manager.block_pool
+                free_blocks = bp.get_num_free_blocks()
+                total_blocks = bp.num_gpu_blocks
+                usage = bp.get_usage()
+            except Exception:
+                pass
+
+            # Base-scheduler decisions this step: preemption (allocate_slots pool
+            # pressure) and completions distinguish a pool-eviction churn from a
+            # mamba-align reason-4 zero-chunk.
+            preempted = getattr(scheduler_output, "preempted_req_ids", None)
+            finished = getattr(scheduler_output, "finished_req_ids", None)
+            n_preempted = len(preempted) if preempted else 0
+            n_finished = len(finished) if finished else 0
+
+            reasons = []
+            for req in live:
+                try:
+                    ncomp = req.num_computed_tokens
+                    ntok = req.num_tokens
+                    nspec = getattr(req, "num_tokens_with_spec", ntok)
+                    nph = getattr(req, "num_output_placeholders", 0)
+                    nprompt = req.num_prompt_tokens
+                    num_new = nspec + nph - ncomp
+                    phase = "prefill" if ncomp < nprompt else "decode"
+                    reasons.append(
+                        f"{req.request_id[:8]}:{phase} "
+                        f"comp={ncomp} prompt={nprompt} tok={ntok} "
+                        f"spec={nspec} ph={nph} num_new={num_new}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    reasons.append(f"<req-introspect-failed: {exc}>")
+
+            logger.warning(
+                "[SCHED_DIAG] EMPTY BATCH with work: scheduled_tokens=0, "
+                "state=%s, running(visible)=%d, hidden_decode=%d, holdback=%d, "
+                "waiting=%d | free_blocks=%s/%s usage=%.3f | preempted=%d "
+                "finished=%d | mamba_align_split=%s max_kv_concurrent=%s | "
+                "reqs=[%s]",
+                self._state,
+                len(self.running),
+                len(running_holdback),
+                len(self.holdback_queue),
+                len(self.waiting),
+                free_blocks,
+                total_blocks,
+                usage if usage is not None else -1.0,
+                n_preempted,
+                n_finished,
+                getattr(self, "need_mamba_block_aligned_split", "n/a"),
+                getattr(self, "_max_kv_concurrent", "n/a"),
+                "; ".join(reasons),
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break scheduling
+            logger.warning("[SCHED_DIAG] diagnostic failed: %s", exc)
+
     def schedule(self) -> "SchedulerOutput":
         """Schedule requests with prefill/decode separation and bucket padding.
 
@@ -869,6 +1037,14 @@ class NeuronScheduler(Scheduler):
         finally:
             if hidden_count > 0:
                 self.max_num_running_reqs += hidden_count
+
+        # DIAGNOSTIC (default-OFF): when VLLM_NEURON_SCHED_DIAG=1, log why a
+        # schedule() step produced an empty batch while requests are unfinished
+        # (the hybrid mml512/bs>1 livelock). Captures free-block count, per-req
+        # progress, and the base scheduler's decisions so the empty-batch cause
+        # (mamba-align reason-4 chunk vs allocate_slots preemption vs pool) can
+        # be pinned on device. No behavioral change; pure observation.
+        self._log_empty_batch_diag(scheduler_output, running_holdback)
 
         # Step 5: Restore holdbacks
         self.running = self.running + running_holdback

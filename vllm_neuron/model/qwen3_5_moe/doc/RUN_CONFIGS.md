@@ -124,17 +124,37 @@ vllm serve $CKPT --tensor-parallel-size 8 --enable-expert-parallel \
 ```
 Verified on device (trn2, TP8/EP8, `vllm bench serve`): bs4 ~59 tok/s and bs8
 ~131 tok/s, 24/24 completed, KV usage ~1–6%. **Use `max-model-len 1024` (with
-`kv_segment_size_buckets:[512]`) for any batch size > 1 — do NOT drop it to 512.**
-With `max-model-len 512` + bs>1 each request reserves its full worst-case KV
-allocation, so the hybrid (attention + GatedDeltaNet) unified block pool saturates
-at ~3 concurrent decodes; a 4th request cannot be admitted or preempt, and once a
-running decode crosses the 256-token attention block boundary `schedule()` returns
-empty batches indefinitely (py-spy: all workers idle in shm `acquire_read`,
-EngineCore in `time.sleep` at `core.py` `_process_engine_step` with
-`has_unfinished_requests()` true; KV pinned at 88.8%). This is an admission-control
-limitation of `_max_kv_concurrent` for the hybrid pool (it uses the attention-only
-`get_max_concurrency_for_kv_cache_config` = 542x and does not account for the
-mamba/GDN page footprint), tracked separately. Not reproducible at bs1.
+`kv_segment_size_buckets:[512]`) for best multi-batch throughput.**
+
+A tight `max-model-len 512` + bs>1 makes each request reserve its full worst-case
+KV allocation up front, so the hybrid (attention + GatedDeltaNet) unified block pool
+can saturate at only ~3 concurrent decodes (~803 blocks/request, dominated by the
+GatedDeltaNet mamba page, not the 256-token attention block). Historically a 4th
+request then could neither be admitted nor preempt: `schedule()` Step 3.2 hid all
+running decodes to make room for the waiting prefill, but the base scheduler could
+not allocate that prefill (only ~303 of 2713 blocks free) and could not preempt the
+now-hidden decodes → `scheduled_tokens=0` indefinitely (py-spy: all workers idle in
+shm `acquire_read`, EngineCore in `time.sleep` at `core.py` `_process_engine_step`
+with `has_unfinished_requests()` true; KV pinned at 88.8%). `_max_kv_concurrent`
+does not catch this because it counts request concurrency by tokens (the
+attention-only `get_max_concurrency_for_kv_cache_config` = 542x) and is blind to the
+mamba/GDN page footprint.
+
+**Fixed by a pool-aware admission gate** (`NeuronScheduler._pool_admission_ok`, in
+`can_schedule`): before admitting a prefill it predicts that request's worst-case
+block footprint via the KV manager's own coordinator
+(`get_num_blocks_to_allocate(..., apply_admission_cap=True)`, the same math as
+`allocate_slots(full_sequence_must_fit=True)`) and defers admission when
+`need > free`, instead of dead-ending into empty batches. So `max-model-len 512` +
+bs>1 now runs correctly — the gate throttles admitted concurrency to what the pool
+can hold. Device A/B (trn2, TP8/EP8, warm cache): gate ON bs4/mml512 in256/out128 →
+24/24 completed, ~68.6 tok/s, peak KV 1.2%, 0 empty-batch steps, 2 pool deferrals;
+gate OFF (control) → stall, ~497k empty-batch steps; gate ON bs8/mml1024
+(non-regression) → 24/24, ~90 tok/s, 0 deferrals (gate transparent when the pool has
+room). Kill-switch: `VLLM_NEURON_POOL_ADMISSION_GATE=0` (default on; not recommended
+for hybrid models with a tight `max-model-len`). The gate lives in the
+model-agnostic baseline `NeuronScheduler`, so it applies to any hybrid model, not
+just Qwen3.6. Not applicable at bs1 (single request never saturates the pool).
 
 ### APC (prefix caching) — EXPERIMENTAL: works below block size, hangs on cross-block reuse
 ```
