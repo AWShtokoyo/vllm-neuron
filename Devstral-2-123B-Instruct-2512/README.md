@@ -629,5 +629,7 @@ vllm_neuron/vllm/platform.py     # Pre-register Ministral3ForCausalLM with a pre
                                  #   load, avoiding the model-inspection subprocess
 docs/model-recipes/index.md      # Add the recipe grid card + toctree entry
 docs/tutorials/index.md          # Add the tutorial grid card + toctree entry
-README.md                        # Add Devstral-2-123B-Instruct-2512 to Contributed Models
 ```
+
+The root `README.md` Contributed Models table is maintained on the release branch
+and taken verbatim from there, so it is not modified on this branch.
