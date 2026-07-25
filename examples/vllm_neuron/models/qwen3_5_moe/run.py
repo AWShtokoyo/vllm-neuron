@@ -17,7 +17,7 @@ Runs OUT OF THE BOX: the validated recipe flags are applied via os.environ.setde
 below, so no `source env.sh` / manual exports are required. An explicit export still
 overrides (setdefault only fills unset vars). For seq >= 512 the bounded-graph GDN prefill
 (VLLM_GDN_SEQ_NKI=1) is REQUIRED — the unsegmented monolithic prefill trips a scatter/gather
-OOB -> NaN. Full recipe: ../../../../vllm_neuron/model/qwen3_5_moe/doc/RUN_CONFIGS.md.
+OOB -> NaN. Full recipe: the Qwen3.6-35B-A3B bundle README (single source of truth).
 """
 import argparse
 import os
