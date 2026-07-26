@@ -82,8 +82,7 @@ apply anything to use it:
 - Registration and the shared-file touch-points (`model/registry.py`,
   `vllm_neuron/__init__.py`, the scheduler / worker / runner pooling branches, the
   non-causal attention fallback, and the LNC1 codegen flag) are committed directly
-  on this branch. The bundled `integration.patch` reproduces the shared-file edits
-  for an out-of-tree install and is not needed here.
+  on this branch.
 
 ### Step 1: Environment Setup
 
@@ -280,25 +279,22 @@ sweeps (TP=1/2/4 × input 128/256/500 × concurrency 1/2/4) are recorded in
 ## Contents of this bundle
 
 The model is integrated in-tree (committed directly on this branch), so the
-top-level `llama-embed-nemotron-8b/` bundle is supplementary — it carries this
-source-of-truth README, a standalone patch of the same edits, and the pooling
-equivalence tests (the repo's generic logit-comparison scripts are causal-LM-only
-and do not apply to a pooling model, so the cosine-equivalence tests are retained
-here).
+top-level `llama-embed-nemotron-8b/` bundle carries this source-of-truth README
+plus the pooling equivalence tests — the repo's generic logit-comparison scripts
+are causal-LM-only and do not apply to a pooling model, so the cosine-equivalence
+tests are retained here as this port's verification entry point.
 
 ```text
 llama-embed-nemotron-8b/
 ├── README.md                          # This file — the source of truth for the port
-├── integration.patch                  # The model package + shared-file edits as a
-│                                       #   standalone patch, for applying the model on
-│                                       #   top of a separately-installed vllm_neuron
-│                                       #   (already committed in-tree here; kept for
-│                                       #   reference / out-of-tree installs)
 └── test/equivalence/                  # Embedding-equivalence tests vs the HF reference
-    ├── cpu_equivalence.py              #   Full vLLM pooling path vs HF ref (CPU, tiny weights)
+    ├── cpu_equivalence.py             #   Full vLLM pooling path vs HF ref (CPU, tiny weights)
     ├── batch_equivalence.py           #   4 seqs / 1 prefill vs solo (no cross-seq leak)
     └── ondevice_equivalence.py        #   Real 8B on trn2 vs transformers-4.x HF ref
 ```
+
+The paths the port touches are listed below; that listing is the record of which
+shared framework files this model changes.
 
 Serving + performance sweep scripts and the recorded bench results (`results/tpN/`)
 are kept internal under `INTERNAL/bringup-benches/` (not part of the public
@@ -344,4 +340,3 @@ vllm_neuron/compile/backend.py                      # Opt-in VLLM_NEURON_FORCE_L
 docs/model-recipes/index.md                         # Link the model recipe
 docs/tutorials/index.md                             # Link the tutorial
 ```
-</content>
