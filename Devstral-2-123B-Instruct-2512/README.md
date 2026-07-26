@@ -144,9 +144,9 @@ no in-repo patch to apply.
 - **One out-of-repo patch:** the optional FP8-native path needs
   [`integration_nkilib.patch`](integration_nkilib.patch) applied to the installed
   `nkilib`, which is a *different package* (bundled inside `neuronx-cc`) and
-  therefore cannot be carried in this tree. See
-  [FP8-native](#fp8-native-optional). Skipping it leaves the default
-  BF16-dequant path fully functional.
+  therefore cannot be carried in this tree. Install it with
+  [Step 3](#step-3-fp8-native-only-install-integration_nkilibpatch); skipping it
+  leaves the default BF16-dequant path fully functional.
 
 **Prerequisites:**
 
@@ -207,6 +207,63 @@ hf download \
 > `/opt/nvme`) or a shared filesystem rather than your home directory to avoid
 > NFS write issues. Instance-store volumes such as `/opt/nvme` are wiped on
 > stop/terminate.
+
+### Step 3 (FP8-native only): install `integration_nkilib.patch`
+
+**Skip this step entirely if you serve on the default BF16-dequant path** — it
+needs nothing beyond a normal build of this branch. The step is required only for
+the FP8-native modes (`fp8:qkv,o_proj` and `fp8:qkv,o_proj,mlp`), because they run
+kernels that this patch fixes.
+
+[`integration_nkilib.patch`](integration_nkilib.patch) edits `nkilib`, the NKI
+kernel library. `nkilib` ships **inside `neuronx-cc`** — there is nothing extra to
+`pip install`, and because it is a different package from `vllm-neuron` the fix
+cannot be carried in this repository. Apply it to the `nkilib` tree that
+`import nkilib` actually resolves to:
+
+```bash
+# 0. From this bundle directory (the one holding integration_nkilib.patch)
+cd /path/to/vllm-neuron/Devstral-2-123B-Instruct-2512
+
+# 1. Locate the nkilib that `import nkilib` RESOLVES TO (not a guessed path).
+#    Patch paths start with nkilib/... , so apply with -p1 from its parent.
+NKILIB="$(python3 -c 'import os,nkilib; print(os.path.dirname(nkilib.__file__))' 2>/dev/null | tail -1)"
+NKROOT="$(dirname "$NKILIB")"                   # parent of the nkilib/ package dir
+echo "nkilib at: $NKILIB"
+[ -d "$NKILIB" ] || { echo "ERROR: nkilib not importable — is neuronx-cc installed in this venv?"; }
+
+# 2. Dry-run, then apply. Use an ABSOLUTE patch path so it resolves in the subshell.
+NKPATCH="$PWD/integration_nkilib.patch"
+( cd "$NKROOT" && git apply --check -p1 "$NKPATCH" )   # verify it applies clean
+( cd "$NKROOT" && git apply        -p1 "$NKPATCH" )    # apply
+# No git available? use patch(1) instead:
+#   ( cd "$NKROOT" && patch -p1 --fuzz=3 < "$NKPATCH" )
+
+# 3. Verify it landed (non-zero count = applied)
+grep -c NKILIB_MLP_BF16_XPOSE_SRC "$NKILIB/core/mlp/mlp_cte/mlp_cte_constants.py"
+
+# To undo:
+#   ( cd "$NKROOT" && git apply -R -p1 "$NKPATCH" )
+```
+
+Always run `git apply --check` (or `patch --dry-run`) first: it reports up-front
+that the `nkilib` tree has diverged instead of half-applying the patch. Reinstalling
+or upgrading `neuronx-cc` replaces `nkilib` and therefore reverts the patch — re-run
+this step after any `neuronx-cc` change.
+
+What the patch contains:
+
+| Fix | Why it is needed |
+|---|---|
+| qkv SBUF-budget fix (committed upstream as nki-library `356f16a`) | Lets the FP8 qkv kernel fit prefill bucket 2048; without it FP8-native is capped at bucket ≤1024 |
+| MLP `dma_transpose` source transpose | The gen3 MLP FP8 path needs the DMA-based transpose; gated by `NKILIB_MLP_BF16_XPOSE_SRC=1` |
+| 32-byte-aligned transpose buffers | Alignment requirement of that transpose |
+| Activation pre-scale by `gate_up_in_scale` | The scale was being skipped, which is what actually broke full-FP8 MLP output |
+
+Then enable the mode itself in `neuron_config` — see
+[FP8-native](#fp8-native-optional). Full FP8 (`fp8:qkv,o_proj,mlp`) additionally
+needs `NKILIB_MLP_BF16_XPOSE_SRC=1` exported in the environment;
+`fp8:qkv,o_proj` does not.
 
 ## Serving
 
@@ -330,24 +387,12 @@ described in [Verification](#verification).
 ### FP8-native (optional)
 
 FP8-native runs the dense projections as FP8×FP8 static matmuls instead of
-dequantizing to BF16. It requires one patch against `nkilib`, which ships *inside*
-`neuronx-cc` (there is nothing extra to `pip install`) and is therefore the one
-artifact this bundle still carries as a patch file:
+dequantizing to BF16.
 
-```bash
-NKILIB="$(python3 -c 'import os,nkilib; print(os.path.dirname(nkilib.__file__))' | tail -1)"
-NKROOT="$(dirname "$NKILIB")"
-( cd "$NKROOT" && git apply --check -p1 /path/to/integration_nkilib.patch )   # verify
-( cd "$NKROOT" && git apply        -p1 /path/to/integration_nkilib.patch )    # apply
-# Confirm it applied:
-grep -c NKILIB_MLP_BF16_XPOSE_SRC "$NKILIB/core/mlp/mlp_cte/mlp_cte_constants.py"   # > 0
-```
-
-Apply it to the `nkilib` that `import nkilib` actually resolves to (the command
-above derives that path). The patch carries the qkv SBUF-budget fix — which lets
-the FP8 qkv kernel fit prefill bucket 2048 — plus the MLP fixes (`dma_transpose`
-source transpose, 32-byte-aligned transpose buffers, activation pre-scale by
-`gate_up_in_scale`). Skipping the patch is fine as long as you stay on `bf16`.
+**Prerequisite:** [`integration_nkilib.patch`](integration_nkilib.patch) must be
+applied to the installed `nkilib` — see
+[Step 3 (FP8-native only)](#step-3-fp8-native-only-install-integration_nkilibpatch)
+for the apply, verify, and undo commands. Staying on `bf16` needs no patch.
 
 Then set the mode; everything else in the serve / offline command is unchanged:
 
