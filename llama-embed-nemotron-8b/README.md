@@ -18,16 +18,34 @@ Unlike a generative LLM, this is a **pooling** model: it is prefill-only (no
 decode, no KV cache, no sampler) and is served with `--runner pooling`, returning
 an embedding vector per input rather than generated tokens.
 
-**Verification scope.** Correctness was verified as embedding equivalence against
-the official HuggingFace `LlamaBidirectionalModel` reference on **TP=1/2/4** on a
-`trn2` instance (worst cosine ≥ 0.99996). Throughput/latency were measured with
-`vllm bench serve` at TP=1/2/4.
-
 **Compatible checkpoints:**
 
 | Model | HuggingFace |
 |-------|-------------|
 | Llama-Embed-Nemotron-8B | [nvidia/llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) |
+
+## Verification scope
+
+Validated on a `trn2` instance (Trainium2) on the Neuron 2.31 stack (vLLM 0.21 /
+vllm-neuron 0.21.0.1.0.0), BF16, `--runner pooling`, `max_model_len=512`:
+
+| Configuration | Status |
+|---|---|
+| TP=1 (with `VLLM_NEURON_FORCE_LNC1=1`) — equivalence + bench | Verified on device |
+| TP=2 — equivalence + bench | Verified on device |
+| TP=4 — equivalence + bench | Verified on device |
+| Multi-sequence prefill packing (4 seqs / 1 prefill) | Verified on device |
+| Online `/v1/embeddings` vs the HF reference | Verified on device |
+
+Correctness is **embedding equivalence** against the official HuggingFace
+`LlamaBidirectionalModel` reference, worst cosine ≥ 0.99996 — see
+[Verification](#verification). The repository's generic logit-validation scripts
+are causal-LM-only and do not apply to a pooling model, so the cosine-equivalence
+tests in this bundle are the verification entry point instead.
+
+**Not verified:** context lengths beyond `max_model_len=512`, quantization other
+than BF16, and pipeline/context parallelism. Every number in this document is this
+port's own measurement.
 
 ## Model Architecture
 
