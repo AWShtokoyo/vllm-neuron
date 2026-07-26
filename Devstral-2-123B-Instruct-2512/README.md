@@ -173,7 +173,7 @@ Export these before any compile / inference run:
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn2       # target Trainium2
 export NEURON_SKIP_EFA_AFFINITY=1                 # skip the EFA NUMA-affinity probe
 export NKI_COMPILE_CACHE_URL=$HOME/nki_cache      # NKI kernel cache
-export VLLM_CACHE_ROOT=/opt/nvme/vllm_cache       # vLLM/NEFF cache (local NVMe)
+export VLLM_CACHE_ROOT=/path/to/scratch/vllm_cache  # vLLM/NEFF cache (fast local disk)
 
 # Extend the timeouts — a 123B model compiles for several minutes
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1200
@@ -203,10 +203,10 @@ hf download \
     --local-dir /path/to/Devstral-2-123B-Instruct-2512
 ```
 
-> **Tip:** On a `trn2` instance, download to a large local disk (e.g.
-> `/opt/nvme`) or a shared filesystem rather than your home directory to avoid
-> NFS write issues. Instance-store volumes such as `/opt/nvme` are wiped on
-> stop/terminate.
+> **Tip:** On a `trn2` instance, download to a large local disk or a shared
+> filesystem rather than your home directory to avoid NFS write issues. Note that
+> instance-store (NVMe) volumes are wiped on stop/terminate, so keep anything you
+> need to retain on EBS or a shared filesystem.
 
 ### Step 3 (FP8-native only): install `integration_nkilib.patch`
 
