@@ -57,7 +57,7 @@ to build and serve the model.
 |---|---|---|---|---|---|
 | [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-devstral-ministral3`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
 | [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-llama-embed-nemotron`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
-| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31b-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
+| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-moe`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
 | [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-27b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-27b/Qwen3.6-27B/README.md) |
 
