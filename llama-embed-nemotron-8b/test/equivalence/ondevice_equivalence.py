@@ -119,7 +119,7 @@ def make_ref(ref_path):
           f"{__import__('transformers').__version__})")
 
 
-def run_ondevice(ref_path):
+def run_ondevice(ref_path, tp=1):
     """Stage 2: feed the saved token ids to the compiled Neuron pooling graph."""
     import vllm_neuron  # noqa: F401  (registers llama_bidirec + platform)
     from vllm import LLM
@@ -129,7 +129,7 @@ def run_ondevice(ref_path):
     refs = blob["refs"]
     prompts = blob.get("prompts", [f"prompt{i}" for i in range(len(token_ids))])
 
-    print("\nbuilding vLLM LLM on Neuron (TP=1, runner=pooling)...")
+    print(f"\nbuilding vLLM LLM on Neuron (TP={tp}, runner=pooling)...")
     # Buckets MUST be > 128 (the TKG/decode-mode threshold in NF.mlp); keep all
     # prefill buckets in CTE mode. Feed prompt_token_ids directly (matches the
     # exact tokenization used for the reference; no tokenizer dependence here).
@@ -138,7 +138,7 @@ def run_ondevice(ref_path):
         runner="pooling",
         max_model_len=512,
         max_num_seqs=1,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tp,
         additional_config={
             "neuron_config": {"num_batched_tokens_buckets": [256, 512]},
         },
@@ -188,12 +188,15 @@ def main():
                     help="path to the precomputed reference .pt")
     ap.add_argument("--make-ref", action="store_true",
                     help="Stage 1: build the reference on a transformers 4.x venv")
+    ap.add_argument("--tp", type=int, default=1,
+                    help="Stage 2 tensor-parallel size (1, 2 or 4). VLLM_NEURON_FORCE_LNC1 "
+                         "is required at TP=1 and must be unset at TP>=2")
     args = ap.parse_args()
 
     if args.make_ref:
         make_ref(args.ref)
     else:
-        run_ondevice(args.ref)
+        run_ondevice(args.ref, tp=args.tp)
 
 
 if __name__ == "__main__":

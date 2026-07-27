@@ -26,8 +26,10 @@ an embedding vector per input rather than generated tokens.
 
 ## Verification scope
 
-Validated on a `trn2` instance (Trainium2) on the Neuron 2.31 stack (vLLM 0.21 /
-vllm-neuron 0.21.0.1.0.0), BF16, `--runner pooling`, `max_model_len=512`:
+Validated on a `trn2.48xlarge` (Trainium2) on the Neuron 2.31 stack (vLLM 0.21 /
+vllm-neuron 0.21.0.1.0.0 / neuronx-cc 2.26 / nki 0.5.0 / torch 2.11), BF16,
+`--runner pooling`, `max_model_len=512`. TP=1/2/4 each use at most one Trainium2
+chip's worth of logical cores, so they also fit a `trn2.3xlarge`:
 
 | Configuration | Status |
 |---|---|
@@ -242,16 +244,32 @@ VLLM_NEURON_CPU_MODE=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
 
 # On-device equivalence (trn2): builds the HF reference on a transformers-4.x
 # venv (REF_VENV), then compares against the on-device 2.31 result.
-REF_VENV=$HOME/tf4x_venv python3 test/equivalence/ondevice_equivalence.py
+# Stage 1 (once, on the transformers-4.x venv — CPU, no Neuron):
+$REF_VENV/bin/python3 test/equivalence/ondevice_equivalence.py \
+    --make-ref --ref $HOME/ref_embeddings.pt
+
+# Stage 2 (on the 2.31 venv, on device). --tp selects the parallel size;
+# VLLM_NEURON_FORCE_LNC1=1 is required at TP=1 and must be unset at TP>=2.
+VLLM_NEURON_FORCE_LNC1=1 python3 test/equivalence/ondevice_equivalence.py \
+    --ref $HOME/ref_embeddings.pt --tp 1
+python3 test/equivalence/ondevice_equivalence.py \
+    --ref $HOME/ref_embeddings.pt --tp 2
+python3 test/equivalence/ondevice_equivalence.py \
+    --ref $HOME/ref_embeddings.pt --tp 4
 ```
 
 | Test | Result |
 |---|---|
-| CPU equivalence (full vLLM pooling path, tiny weights) | worst cos = 0.999962 |
-| On-device equivalence (trn2 TP=1, real 8B) | worst cos = 0.999961 |
-| Batched on-device (4 seqs / 1 prefill, vs solo) | cos = 1.000000 (no cross-sequence leak) |
-| vLLM serving `/v1/embeddings` vs HF reference | worst cos = 0.999962 |
-| Cross-prompt similarity (discriminative check) | ~0.28–0.30 (distinct prompts stay distinct) |
+| CPU equivalence (full vLLM pooling path, tiny weights) | worst cos = 0.999963 |
+| On-device equivalence (TP=1, real 8B) | worst cos = 0.999955 |
+| On-device equivalence (TP=2, real 8B) | worst cos = 0.999952 |
+| On-device equivalence (TP=4, real 8B) | worst cos = 0.999954 |
+| Batched (4 seqs / 1 prefill, vs solo) | cos = 1.000000 (no cross-sequence leak) |
+| Batched (4 seqs / 1 prefill, vs HF reference) | worst cos = 0.999956 |
+| Cross-prompt similarity (discriminative check) | 0.28–0.30 (distinct prompts stay distinct) |
+
+All three parallel sizes land in the same 0.99995 band, so TP does not move the
+embedding math; the residual is bf16 accumulation-order noise.
 
 > **Reference build note.** On the Neuron 2.31 stack (transformers ≥ 5.13) the HF
 > *reference* class must be built on a **transformers-4.x** venv — the equivalence
@@ -273,25 +291,32 @@ vllm bench serve \
 
 ## Measured performance
 
-`trn2`, bf16, `--runner pooling`, `random` dataset, 64 prompts, `max_model_len`
-512. Throughput is total token throughput (input tokens only — embedding has no
-output tokens); latency is end-to-end per request.
+`trn2.48xlarge`, bf16, `--runner pooling`, `vllm bench serve --backend
+openai-embeddings`, `random` dataset, 64 prompts, `max_model_len` 512,
+`max_num_seqs` 4. Throughput is total token throughput (input tokens only —
+embedding has no output tokens); latency is end-to-end per request.
 
 | TP | input len | concurrency | req/s | tok/s | p50 (ms) | p99 (ms) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 128 | 4 | 18.3 | 2,339 | 216.8 | 232.2 |
-| 1 | 256 | 2 | 14.0 | 3,583 | 141.2 | 156.9 |
-| 1 | 500 | 2 | 6.9 | 3,427 | 290.6 | 295.1 |
-| 2 | 128 | 4 | 66.7 | 8,532 | 58.1 | 71.8 |
-| 2 | 256 | 4 | 35.3 | 9,049 | 111.2 | 128.7 |
-| 2 | 500 | 2 | 17.8 | 8,912 | 110.7 | 116.9 |
-| 4 | 128 | 4 | 55.4 | 7,087 | 69.1 | 87.1 |
-| 4 | 256 | 4 | 44.5 | 11,381 | 86.9 | 104.9 |
-| 4 | 500 | 2 | 22.6 | 11,278 | 86.9 | 92.1 |
+| 1 | 128 | 4 | 18.4 | 2,349 | 215.8 | 233.2 |
+| 1 | 256 | 2 | 14.1 | 3,596 | 141.1 | 146.1 |
+| 1 | 500 | 4 | 6.9 | 3,427 | 581.6 | 587.7 |
+| 2 | 128 | 4 | 66.0 | 8,451 | 57.7 | 75.2 |
+| 2 | 256 | 4 | 35.2 | 9,016 | 111.5 | 127.7 |
+| 2 | 500 | 4 | 17.8 | 8,880 | 223.2 | 229.9 |
+| 4 | 128 | 4 | 74.0 | 9,466 | 51.9 | 69.2 |
+| 4 | 256 | 4 | 44.6 | 11,414 | 87.2 | 104.5 |
+| 4 | 500 | 4 | 22.7 | 11,350 | 174.3 | 180.6 |
 
-Peak throughput per TP (256-token inputs, concurrency 4): **TP=1 ≈ 3,583 tok/s**,
-**TP=2 ≈ 9,049 tok/s** (2.5× TP=1), **TP=4 ≈ 11,381 tok/s** (3.2× TP=1). Full
-sweeps (TP=1/2/4 × input 128/256/500 × concurrency 1/2/4) are recorded in
+Peak throughput per TP (256-token inputs, concurrency 4): **TP=1 ≈ 3,596 tok/s**
+(reached at concurrency 2), **TP=2 ≈ 9,016 tok/s** (2.5× TP=1), **TP=4 ≈
+11,414 tok/s** (3.2× TP=1). Scaling is super-linear from TP=1 to TP=2 (2× compute
+plus the bf16 weights split across two cores doubles per-core HBM bandwidth) and
+sub-linear from TP=2 to TP=4, where collective overhead starts to dominate for
+these short sequences. Latency improves monotonically with TP at every point.
+
+Full sweeps (TP=1/2/4 × input 128/256/500 × concurrency 1/2/4 = 27 runs, all
+64/64 requests successful with 0 failures) are recorded in
 `INTERNAL/bringup-benches/`.
 
 ## Contents of this bundle
