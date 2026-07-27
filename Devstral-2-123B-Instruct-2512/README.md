@@ -41,6 +41,7 @@ neuronx-cc 2.26 / nki 0.5.0 / torch 2.11):
 | TP=8 × DP=1 (one replica, 2 chips), full FP8 + FP8 KV cache | Verified on device |
 | TP=8 × DP=8 (whole box, 8 replicas), full FP8 + FP8 KV cache | Verified on device |
 | Multi-bucket prefill (opt-in), DP=8 short-input burst | Verified on device |
+| `integration_nkilib.patch` install procedure ([Step 3](#step-3-fp8-native-only-install-integration_nkilibpatch)) | Verified against a pristine `neuronx-cc 2.26.6360.0` `nkilib`: `--check`, apply, `patch(1)` fallback, and revert all succeed |
 
 Accuracy was verified by a **same-build BF16-vs-FP8 A/B on device** (first-token
 agreement plus the checkpoint's own HuggingFace model-card "Tests" prompts) — see
@@ -250,6 +251,16 @@ Always run `git apply --check` (or `patch --dry-run`) first: it reports up-front
 that the `nkilib` tree has diverged instead of half-applying the patch. Reinstalling
 or upgrading `neuronx-cc` replaces `nkilib` and therefore reverts the patch — re-run
 this step after any `neuronx-cc` change.
+
+> **`--check` fails on an already-patched tree too.** `git apply --check` reports
+> `patch does not apply` both when the tree has genuinely diverged and when the
+> patch is simply already in place. To tell the two apart, probe the reverse
+> direction — it exits 0 only if the patch is already applied:
+>
+> ```bash
+> ( cd "$NKROOT" && git apply -R --check -p1 "$NKPATCH" ) \
+>   && echo "already applied — skip step 2" || echo "not applied (or tree diverged)"
+> ```
 
 What the patch contains:
 
