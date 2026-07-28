@@ -19,6 +19,13 @@ Model recipe for GPT-OSS 20B and 120B (MoE) on Trn2/Trn3.
 Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy GLM-5.2
+:link: glm-5.2
+:link-type: doc
+
+Model recipe for GLM-5.2 (MoE, MLA, MTP) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -27,4 +34,5 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
+GLM-5.2 <glm-5.2>
 :::

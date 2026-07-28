@@ -5,6 +5,8 @@ from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
+from .glm_5_2 import Glm52ForCausalLM
+from .glm_5_2.mtp import Glm52MtpForCausalLMFactory
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -21,6 +23,11 @@ def get_models() -> list[tuple[str, type]]:
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+        ("GlmMoeDsaForCausalLM", Glm52ForCausalLM),
+        # GLM-5.2 layer-78 MTP self-speculative draft head. MtpProposer hard-sets
+        # the draft arch to this name (vLLM's hf_config_override rewrites the raw
+        # glm_moe_dsa draft arch to DeepSeekMTPModel).
+        ("Glm52MtpForCausalLM", Glm52MtpForCausalLMFactory),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

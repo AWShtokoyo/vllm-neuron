@@ -50,6 +50,11 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_PREFILL_WARMUP: bool = False
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_LIBTORCH_NEURONX_LITE: bool = True
+    # When True, the compile backend skips FX-graph input deduplication.
+    # Multiple FX placeholders that alias the same runtime storage become
+    # multiple HLO parameters; the runtime still allocates one byte buffer
+    # per bucket (KVCacheTensor.shared_by) so HBM usage should not change.
+    VLLM_NEURON_DISABLE_INPUT_DEDUP: bool = False
     VLLM_NEURON_EFA_INSTANCE_FAMILY: str = ""
 
 
@@ -251,6 +256,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (which defaults any trn3* to trn3pds and any trn2* to trn2).
     "VLLM_NEURON_EFA_INSTANCE_FAMILY": lambda: os.getenv(
         "VLLM_NEURON_EFA_INSTANCE_FAMILY", ""
+    ),
+    # Skip FX-graph input deduplication (compile/backend.py).
+    "VLLM_NEURON_DISABLE_INPUT_DEDUP": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_INPUT_DEDUP")) or False
     ),
 }
 

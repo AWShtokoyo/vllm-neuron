@@ -129,6 +129,7 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "fp8",
     ]
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1

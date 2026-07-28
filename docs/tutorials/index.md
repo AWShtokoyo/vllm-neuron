@@ -33,6 +33,13 @@ Measure TTFT improvement from prefix caching with GPT-OSS.
 Serve the multimodal Qwen3-VL-32B model.
 :::
 
+:::{grid-item-card} Deploy GLM-5.2
+:link: tutorial-glm-5.2
+:link-type: doc
+
+Serve the GLM-5.2 MoE model with FP8 and MTP self-speculation.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Disaggregated inference (1P1D and xPyD) <tutorial-di-1p1d-xpyd>
 Deploying gpt-oss <tutorial-gpt-oss>
 Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmarking>
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
+Deploying GLM-5.2 <tutorial-glm-5.2>
 :::

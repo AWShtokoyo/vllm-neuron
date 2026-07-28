@@ -561,6 +561,13 @@ def preprocess_and_validate_inputs(gm, example_inputs):
     """
     _validate_inputs_on_device(example_inputs)
 
+    if envs.VLLM_NEURON_DISABLE_INPUT_DEDUP:
+        logger.info(
+            "Input dedup skipped (VLLM_NEURON_DISABLE_INPUT_DEDUP=1); "
+            "every storage-aliased FX placeholder will become its own HLO parameter"
+        )
+        return gm, example_inputs
+
     keep_mask, dupe_map = _detect_duplicate_inputs(example_inputs)
     has_dupes = any(not k for k in keep_mask)
 
