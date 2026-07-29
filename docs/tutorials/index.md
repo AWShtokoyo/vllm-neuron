@@ -33,6 +33,13 @@ Measure TTFT improvement from prefix caching with GPT-OSS.
 Serve the multimodal Qwen3-VL-32B model.
 :::
 
+:::{grid-item-card} Deploy Gemma 4 31B
+:link: tutorial-gemma4-31b
+:link-type: doc
+
+Serve the Gemma 4 31B IT text model.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Disaggregated inference (1P1D and xPyD) <tutorial-di-1p1d-xpyd>
 Deploying gpt-oss <tutorial-gpt-oss>
 Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmarking>
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
+Deploying Gemma 4 31B <tutorial-gemma4-31b>
 :::

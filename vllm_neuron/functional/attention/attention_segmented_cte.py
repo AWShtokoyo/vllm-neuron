@@ -32,8 +32,11 @@ try:
 except Exception:
     pass
 
-# Maximum head dimension supported by the NKI kernel (SBUF partition constraint).
-_MAX_HEAD_DIM = 128
+# Maximum head dimension supported by the NKI kernel. nkilib's
+# attention_segmented_cte asserts `head_dim <= 512` and tiles the head
+# dimension internally; head dims above 256 additionally require
+# `prior_seg_size <= 2048`.
+_MAX_HEAD_DIM = 512
 
 
 def _decode_packed_to_segmented_packed(k_cache: Tensor) -> Tensor:
@@ -505,7 +508,7 @@ def segmented_attention(
     Dimensions:
         B: Batch size (can include num_heads for multi-head attention)
         S_q: Query sequence length
-        D: Head dimension (max 128)
+        D: Head dimension (max 512)
 
     Args:
         q: Query tensor
@@ -533,7 +536,7 @@ def segmented_attention(
 
     Raises:
         ValueError: If any kernel constraint is violated:
-            - head_dim > 128
+            - head_dim > 512
             - kv_segment_size not in SUPPORTED_KV_SEGMENT_SIZES
             - kv_segment_size not divisible by block_size
             - sliding_window not divisible by block_size (when set)
@@ -592,7 +595,7 @@ def segmented_attention(
     seqlen_q = q.shape[1] if tp_q else q.shape[2]
     d_head = q.shape[2] if tp_q else q.shape[1]
 
-    # 1. head_dim must fit in a single SBUF partition (128 elements)
+    # 1. head_dim must not exceed what the kernel tiles (see _MAX_HEAD_DIM)
     if d_head > _MAX_HEAD_DIM:
         raise ValueError(
             f"head_dim={d_head} exceeds maximum supported head dimension "

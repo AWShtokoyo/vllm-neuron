@@ -13,7 +13,12 @@ jitted_attention_cte = nki.jit()(attention_cte)
 # Match kernel constraints in attention_cte
 MAX_BS = 512
 MAX_SEQLEN = 131072
-MAX_HEAD_DIM = 128
+# nkilib's attention_cte declares `_MAX_HEAD_DIM = 512` and tiles the head
+# dimension internally, so head dims above the 128 SBUF partition width are
+# supported. Keep this in sync with that kernel constant — a lower value here
+# silently routes large-head-dim models (e.g. Gemma 4's 256/512) to the
+# PyTorch fallback instead of the kernel.
+MAX_HEAD_DIM = 512
 
 
 # TODO: Define this NKI attention_cte kernel constraints check in NKILIB
@@ -227,7 +232,7 @@ def flash_attention(
         B: Batch size (can include num_heads for multi-head attention)
         S_q: Query sequence length
         S_k: Key/Value sequence length
-        D: Head dimension (max 128)
+        D: Head dimension (max 512)
 
     Args:
         q: Query tensor
@@ -263,7 +268,7 @@ def flash_attention(
         - All inputs must be 3D tensors
         - Batch size: 1 to 16
         - Q batch size must be multiple of KV batch size (for GQA)
-        - Head dimension D: 1 to 128
+        - Head dimension D: 1 to 512
         - Sequence lengths: 1 to 32K
         - sliding_window/prefix_caching/CP require scale=1.0
         - sliding_window and CP require causal_mask=True

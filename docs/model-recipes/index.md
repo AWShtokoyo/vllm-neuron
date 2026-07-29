@@ -19,6 +19,13 @@ Model recipe for GPT-OSS 20B and 120B (MoE) on Trn2/Trn3.
 Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy Gemma 4 31B
+:link: gemma4-31b
+:link-type: doc
+
+Model recipe for Gemma 4 31B IT (sliding-window + global attention) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -27,4 +34,5 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
+Gemma 4 31B <gemma4-31b>
 :::

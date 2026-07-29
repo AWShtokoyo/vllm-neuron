@@ -280,7 +280,37 @@ def _get_activation_fn(act_fn: ActFnType):
     elif act_fn == ActFnType.GELU:
         return torch.nn.functional.gelu
     elif act_fn == ActFnType.GELU_Tanh_Approx:
-        return lambda x: torch.nn.functional.gelu(x, approximate="tanh")
+        # Inline the tanh approximation instead of
+        # ``F.gelu(x, approximate="tanh")``: on the libtorch_neuronx_lite stack
+        # that call dispatches to ``torch._C._nn.gelu``, which Dynamo cannot
+        # trace ("Attempted to call function marked as skipped"). This bites the
+        # torch fallback path (``_torch_mlp_impl``) used by models whose
+        # intermediate_size exceeds the NKI MLP kernel tiling constraint (e.g.
+        # Gemma4, I=21504). 0.7978845608028654 == sqrt(2/pi).
+        #
+        # Evaluate in fp32 and cast back, which is what ``F.gelu`` does
+        # internally. Computing the cube and tanh in bf16/fp16 throughout
+        # instead costs ~15 ULP on average and up to ~257 ULP worst case
+        # (measured on CPU against an fp32 reference), because ``x**3``
+        # overflows the mantissa; ``F.gelu`` stays within 1 ULP. The MLP
+        # activation feeds every subsequent layer, so that error compounds —
+        # and this resolver is shared by every model using GELU_Tanh_Approx,
+        # not just Gemma4.
+        def _gelu_tanh(x: Tensor) -> Tensor:
+            x32 = x.float()
+            out = (
+                0.5
+                * x32
+                * (
+                    1.0
+                    + torch.tanh(
+                        0.7978845608028654 * (x32 + 0.044715 * x32 * x32 * x32)
+                    )
+                )
+            )
+            return out.to(x.dtype)
+
+        return _gelu_tanh
     else:
         raise ValueError(f"Unsupported activation function: {act_fn}")
 

@@ -218,8 +218,71 @@ def register():
     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
 
     _patch_dcp_config_validation()
+    _register_gemma4_hf_config()
 
     return get_platform_class()
+
+
+def _register_gemma4_hf_config() -> None:
+    """Register a text-only Gemma4 model_type with HuggingFace AutoConfig.
+
+    google/gemma-4-31B-it uses model_type `gemma4` (text params nested under
+    `text_config`, typed as `gemma4_text`). vLLM calls AutoConfig.from_pretrained()
+    before dispatching to our Neuron model, so we register minimal PretrainedConfig
+    subclasses that carry the nested text_config through. The actual model is built
+    from these via vllm_neuron.model.gemma4.config.Gemma4Config.from_configs().
+
+    We serve Gemma4 **text-only**, which mirrors how transformers 5.x itself
+    separates gemma4 into a TEXT architecture (`Gemma4ForCausalLM` /
+    `gemma4_text`) and a MULTIMODAL one (`Gemma4ForConditionalGeneration` /
+    `gemma4_mm`). Two things are forced here so the model routes down the text
+    path end-to-end:
+
+    1. **`architectures = ['Gemma4ForCausalLM']`.** The gemma-4-31B checkpoint
+       declares the *multimodal* arch name `Gemma4ForConditionalGeneration`,
+       which vLLM-core maps to `gemma4_mm` (a multimodal model). Multimodality
+       is decided from the arch name in the *main* process — before our Neuron
+       worker registers anything — so overriding the config class alone is not
+       enough: vLLM-core's renderer still selects `gemma4_mm` and its
+       `get_supported_mm_limits()` rejects our config type. Rewriting the arch
+       to the native text name `Gemma4ForCausalLM` (vLLM-core: non-multimodal
+       text) is what actually disengages the multimodal renderer. This is the
+       orthodox alignment to upstream's own text/mm split.
+    2. **Drop `vision_config` / `audio_config`.** With no `vision_config`
+       attribute, the Neuron platform also keeps the model off its multimodal
+       load/forward path (`text_neuron_config`/`vision_neuron_config` kwargs and
+       `vision_embedding_blocks`/`vision_positions` forward inputs), which the
+       text-only decoder does not accept.
+
+    Newer transformers releases (5.x) ship a *native* multimodal `gemma4` config
+    that always synthesizes a `vision_config`. We therefore register with
+    `exist_ok=True` to override that native mapping with our text-only config,
+    rather than skipping when the model_type is already present.
+    """
+    from transformers import AutoConfig, PretrainedConfig
+
+    class _Gemma4TextConfig(PretrainedConfig):
+        model_type = "gemma4_text"
+
+    class _Gemma4Config(PretrainedConfig):
+        model_type = "gemma4"
+        sub_configs = {"text_config": _Gemma4TextConfig}
+
+        def __init__(self, text_config=None, **kwargs):
+            # Text-only: drop the multimodal sub-configs so downstream
+            # `hasattr(hf_config, "vision_config")` checks stay False.
+            kwargs.pop("vision_config", None)
+            kwargs.pop("audio_config", None)
+            # Present as the transformers-5.x native TEXT architecture so
+            # vLLM-core routes to the non-multimodal text model (see docstring).
+            kwargs["architectures"] = ["Gemma4ForCausalLM"]
+            if isinstance(text_config, dict):
+                text_config = _Gemma4TextConfig(**text_config)
+            self.text_config = text_config
+            super().__init__(**kwargs)
+
+    for mt, cls in (("gemma4_text", _Gemma4TextConfig), ("gemma4", _Gemma4Config)):
+        AutoConfig.register(mt, cls, exist_ok=True)
 
 
 def __getattr__(name):
