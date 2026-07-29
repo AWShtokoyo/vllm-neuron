@@ -245,23 +245,29 @@ def collect_carry_forward_ids(
     input_batch: Any,
     requests: dict[str, Any],
     copy_state: NeuronMambaCopyState,
-    device: torch.device,
-    max_rows: int,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> dict[int, tuple[list[int], list[int]]] | None:
     """IN-GRAPH carry-forward (task #106 fix): instead of the eager per-row copy in
     _execute_plan (which overflows the DMA descriptor at concurrency -> dmem_copy ret=-7),
-    resolve the SAME upstream block-index bookkeeping to a pair of FIXED-SHAPE int32 block-id
-    vectors (src_ids, dst_ids) of length ``max_rows`` (== max_num_seqs), padded with -1.
+    resolve the SAME upstream block-index bookkeeping to (src_block_id, dst_block_id) pairs
+    PER RECURRENT KV-CACHE GROUP, applied per-layer in the forward via paged_state_gather(src)->
+    paged_state_scatter(dst): ONE .ap dispatch per layer, mirroring upstream's single batched
+    batch_memcpy launch.
 
-    All GDN layers share ONE block table, so (src,dst) pairs are IDENTICAL across layers -> one
-    vector pair per step, applied per-layer in the forward via paged_state_gather(src)->
-    paged_state_scatter(dst): ONE .ap dispatch per layer (O(layers), not O(pairs*layers)),
-    mirroring upstream's single batched batch_memcpy launch. Returns (src,dst) int32 on ``device``
-    (-1 = skip), or None if no carry copies this step. Block-index math == verbatim upstream port."""
+    A hybrid model has one MambaSpec group per ``group_size`` recurrent layers (3 for Qwen3.6:
+    30 recurrent / group_size 10), and the shared BlockPool hands each group DISJOINT block ids
+    -> a layer in group g MUST resolve its (src,dst) through block_ids[g]. Using group 0's ids
+    for every layer leaves groups 1..N-1 unmigrated (silent recurrent-state reset at each
+    mamba_block_size boundary; see CARRY_FORWARD_GROUP_BUG). The block INDEX math is
+    group-independent (all mamba groups share ONE spec; asserted in NeuronMambaCopyState.create),
+    so it is computed once per request and applied per group.
+
+    Returns ``{gid: (src_list, dst_list)}`` (plain Python lists; the runner sizes the padded
+    per-layer tensors to the SAME batch dim as state_indices), keyed only by groups that have at
+    least one carry copy this step, or None if no group carries. Block-index math == verbatim
+    upstream port."""
     mamba_spec = copy_state.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
     block_size = mamba_spec.block_size
-    gid = copy_state.mamba_group_ids[0]
 
     finished_req_ids = scheduler_output.finished_req_ids
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
@@ -269,8 +275,9 @@ def collect_carry_forward_ids(
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         mamba_state_idx.pop(req_id, None)
 
-    src_list: list[int] = []
-    dst_list: list[int] = []
+    per_gid: dict[int, tuple[list[int], list[int]]] = {
+        gid: ([], []) for gid in copy_state.mamba_group_ids
+    }
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
@@ -289,19 +296,15 @@ def collect_carry_forward_ids(
                     "Neuron mamba align-mode APC does not support spec-decode partial-block "
                     "carry copies (num_accepted != 1)."
                 )
-            block_ids = req_state.block_ids[gid]
-            s = int(block_ids[prev_state_idx]); d = int(block_ids[curr_state_idx])
-            if s != d:
-                src_list.append(s); dst_list.append(d)
+            # Each recurrent group has its own disjoint block ids; resolve (src,dst) per group.
+            for gid in copy_state.mamba_group_ids:
+                block_ids = req_state.block_ids[gid]
+                s = int(block_ids[prev_state_idx]); d = int(block_ids[curr_state_idx])
+                if s != d:
+                    per_gid[gid][0].append(s); per_gid[gid][1].append(d)
             input_batch.num_accepted_tokens_cpu[i] = 1
-    if not src_list:
-        return None
-    src = torch.full((max_rows,), -1, dtype=torch.int32, device=device)
-    dst = torch.full((max_rows,), -1, dtype=torch.int32, device=device)
-    n = min(len(src_list), max_rows)
-    src[:n] = torch.tensor(src_list[:n], dtype=torch.int32, device=device)
-    dst[:n] = torch.tensor(dst_list[:n], dtype=torch.int32, device=device)
-    return src, dst
+    out = {gid: p for gid, p in per_gid.items() if p[0]}
+    return out or None
 
 
 def preprocess_mamba_neuron(

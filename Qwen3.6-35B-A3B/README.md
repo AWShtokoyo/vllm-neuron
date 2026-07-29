@@ -24,17 +24,44 @@ tower.
 > both under `qwen3_5_moe`). Validated on device with Qwen3.6-35B-A3B weights; serves
 > Qwen3.5-35B-A3B unchanged.
 
-**Verification scope.** Correctness was validated on `trn2.48xlarge` at **TP8 / EP8**
-(BF16, greedy on-device sampling): **GSM8K-CoT exact-match 95.0%** (batch size 1)
-plus 3-way logit validation. Throughput was measured with `vllm bench serve` /
-`vllm bench throughput` at batch sizes 1/4/8.
-
 **Compatible checkpoints:**
 
 | Model | HuggingFace | Hardware | Quantization |
 |-------|-------------|----------|--------------|
 | Qwen3.6-35B-A3B | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Trn2 | BF16 |
 | Qwen3.5-35B-A3B | [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | Trn2 | BF16 (same arch) |
+
+## Verification scope
+
+Validated on `trn2.48xlarge` (Trainium2, 64 logical NeuronCores at LNC2 / 16 chips)
+at **TP8 / EP8**, BF16, greedy on-device sampling, on the Neuron 2.31 stack
+(vLLM 0.21 / vllm-neuron 0.21.0.1.0.0): **GSM8K-CoT exact-match 93.0%** at batch
+size 1 (100 questions, 4-shot), plus offline batch-1 and online concurrency 1 / 4 / 8
+throughput on the `max_model_len=1024` + `kv_segment_size=512` recipe. Prefix caching
+(APC) was exercised functionally with an 817-token shared prefix at batch size 4.
+
+**Not verified:**
+
+- Tensor/expert-parallel degrees other than TP8 / EP8, and quantization other than
+  BF16.
+- Sequence lengths above `max_model_len=1024`; the segmented GatedDeltaNet prefill
+  path is bounded to ≤ 512-token segments, so longer contexts need a new bucket
+  recipe (and a cold recompile).
+- APC beyond that functional check — no accuracy sweep or throughput measurement was
+  taken with prefix caching enabled.
+- Vision input — the vision tower is skipped and this is a text-only deployment.
+- Chunked GatedDeltaNet prefill — the alternative prefill kernel is present in the
+  tree but **not enabled on this stack**; the segmented path is the only supported
+  GatedDeltaNet prefill for this port.
+
+**Gate this model with GSM8K, not with the generic logit-validation script's stock
+thresholds.** Those thresholds sit below this model's BF16 noise floor — the CPU BF16
+baseline's own L-inf error against FP32 is 0.03–0.11, above the script's static 0.011
+top-5 tolerance — so `run_logit_validation_offline.py` reports FAILED even though every
+prompt's greedy-argmax divergence stays within the script's 1-ULP acceptance threshold.
+
+Every number in this document is this port's own measurement at TP8 / EP8 on the
+current tree.
 
 ## Model Architecture
 
@@ -112,8 +139,7 @@ anything to use it:
 - Registration and the shared-file touch-points (registry, KV-cache `HybridKVSpec`,
   attention block-size alignment, platform hybrid guards, the pool-aware scheduler
   gate, and the runner/worker hybrid-state wiring) are committed directly on this
-  branch. The bundled `integration.patch` reproduces the 7 shared-file edits for an
-  out-of-tree install and is not needed here.
+  branch.
 
 ### Step 1: Environment Setup
 
@@ -153,14 +179,18 @@ export VLLM_MOE_TKG_ROUTER_FP32=1  # fp32 decode router for correct top-8 expert
 ### Step 2: Download the Model
 
 ```bash
-huggingface-cli download \
+hf download \
     Qwen/Qwen3.6-35B-A3B \
     --local-dir /path/to/Qwen3.6-35B-A3B
 ```
 
-> **Tip:** On a `trn2` cluster, download to a large shared or local-NVMe filesystem
-> instead of your home directory to avoid NFS write issues and to keep the checkpoint
-> off the root volume.
+> On the `huggingface_hub` version this stack pins (1.x), the older
+> `huggingface-cli` entry point is removed and only prints a deprecation notice — use
+> `hf download` as above. Set `HF_XET_HIGH_PERFORMANCE=1` for faster transfers (the
+> older `HF_HUB_ENABLE_HF_TRANSFER` is likewise deprecated).
+
+> **Tip:** The BF16 checkpoint is large — download it to a filesystem with room for it
+> rather than the root volume.
 
 ## Serving
 
@@ -266,47 +296,71 @@ sampling).
 
 | Metric | Qwen3.6-35B-A3B, Neuron Trn2 BF16 |
 |--------|:---------------------------------:|
-| GSM8K exact-match (batch size 1) | **95.0%** |
+| GSM8K-CoT exact-match, flexible-extract (batch size 1) | **93.0%** ± 2.6% |
+| GSM8K-CoT exact-match, strict-match (batch size 1) | **92.0%** ± 2.7% |
+
+Measured with `lm_eval --tasks gsm8k_cot` over the OpenAI-compatible endpoint of a
+server started with the online recipe above: 100 questions, 4-shot
+(`--apply_chat_template --fewshot_as_multiturn`), `max_tokens 448`,
+`enable_thinking: false`, `max_length 1024`, `num_concurrent 1`. The ± figures are
+lm_eval's reported standard error; 100 questions is a subset, not the full split.
 
 **Reproduce:** serve the checkpoint with the online recipe above, then run the GSM8K
 task from [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness)
 against the running server over its OpenAI-compatible endpoint. Keep the few-shot
 prompt plus generation length within the 1024-token context window (e.g. 4-shot,
 ≤ 448 generated tokens) so requests are not rejected for exceeding `max_model_len`.
-The port also passes 3-way logit validation (FP32 baseline → BF16 expected → Neuron
-target) via the generic scripts under `examples/vllm_neuron/accuracy/`.
+Disable Qwen3 thinking (`chat_template_kwargs: {"enable_thinking": false}`) so the
+generation budget goes to the answer rather than a truncated `<think>` block. Pass
+the value of `--served-model-name` as lm_eval's `model=` argument, not the checkpoint
+path, or every request is rejected with a 404.
+
+> **Do not gate this model on the generic logit-validation script's stock
+> thresholds** — they sit below this model's BF16 noise floor and report FAILED even
+> though the greedy argmax stays within the script's own 1-ULP acceptance threshold.
+> See [Verification scope](#verification-scope).
 
 ## Measured performance
 
-Output throughput on a `trn2.48xlarge` (TP8/EP8, BF16, greedy) — single batch offline
-with `vllm bench throughput`, multi-batch online with `vllm bench serve`. Throughput
-scales with batch size; time-per-output-token stays flat (~55 ms across batch sizes
-1/4/8), indicating near-linear batch scaling. On the recommended `max_model_len=1024`
-recipe, KV-cache utilization stays low (≤ 6%) even at batch size 8.
+Measured on a `trn2.48xlarge` (TP8/EP8, BF16, greedy on-device sampling,
+`max_model_len=1024` + `kv_segment_size_buckets:[512]`) with the repository's own
+model-agnostic benchmark clients: `vllm bench serve` against a running server for the
+online rows, `vllm bench throughput` for the offline row. Random dataset, 256-token
+input / 128-token output (`--random-range-ratio 0`), `--ignore-eos`, 24 prompts per
+concurrency level online and 16 prompts offline. Every run completed all requests
+(0 failed).
 
-| Configuration | Batch size | Output throughput | KV usage |
-|---------------|:----------:|:-----------------:|:--------:|
-| `max_model_len=1024`, offline | 1 | ~103 tok/s | — |
-| `max_model_len=1024`, `kv_segment_size=512`, online | 4 | ~59 tok/s | ~1% |
-| `max_model_len=1024`, `kv_segment_size=512`, online | 8 | ~131 tok/s | ~6% |
+| Configuration | Concurrency | Output throughput | Mean TPOT | Mean TTFT |
+|---------------|:-----------:|:-----------------:|:---------:|:---------:|
+| `max_model_len=1024`, `kv_segment_size=512`, online | 1 | 22.57 tok/s | 42.18 ms | 314 ms |
+| `max_model_len=1024`, `kv_segment_size=512`, online | 4 | 74.37 tok/s | 48.10 ms | 775 ms |
+| `max_model_len=1024`, `kv_segment_size=512`, online | 8 | 123.78 tok/s | 54.01 ms | 1411 ms |
+| `max_model_len=1024`, offline (`bench throughput`) | 1 | 22.45 tok/s (67.36 total tok/s) | — | — |
 
-Per-request decode is approximately 21 tok/s at batch size 1.
+Output throughput scales 5.5× from concurrency 1 to 8 while time-per-output-token
+grows only 28% (42.2 → 54.0 ms), i.e. the added concurrency is nearly free per token.
+Offline batch-1 matches online concurrency-1 (22.45 vs 22.57 tok/s), so the serving
+stack adds no measurable per-token overhead at batch 1. A second pass of the same
+sweep gave 22.54 / 74.39 / 123.80 tok/s, so these figures repeat to ~0.03 tok/s.
+
+Peak KV-cache utilization stayed at or below **1.5%** across the whole sweep (0.2% at
+1 running request, 0.7% at 4, 1.5% at 8); the server samples this metric every 10 s,
+so these are observed peaks rather than guaranteed maxima.
 
 > **Multi-batch serving: use `max_model_len=1024` with `kv_segment_size=512`** for
-> best throughput (batch sizes 4 and 8 both run cleanly with low KV utilization).
+> best throughput (concurrency 4 and 8 both run cleanly, all requests completed).
 >
 > **Pool-aware admission gate.** A tight `max_model_len=512` makes each request
 > reserve its full worst-case KV allocation up front, so the hybrid (attention +
-> GatedDeltaNet) unified block pool can saturate at only ~3 concurrent decodes (the
-> GatedDeltaNet mamba page dominates, ~800 blocks/request). The scheduler
-> (`NeuronScheduler._pool_admission_ok`, on by default) predicts each incoming
-> prefill's worst-case block footprint against the free pool and defers admission when
-> the pool is full, instead of dead-ending into empty batches. Batch size > 1 at
-> `max_model_len=512` therefore runs correctly — the gate simply throttles concurrency
-> to what the pool can hold, and is a no-op when the pool has room (so it does not
-> affect the `max_model_len=1024` recipe). It can be disabled with
-> `VLLM_NEURON_POOL_ADMISSION_GATE=0` (not recommended for hybrid models with a tight
-> `max_model_len`).
+> GatedDeltaNet) unified block pool can saturate at only a few concurrent decodes.
+> The scheduler (`NeuronScheduler._pool_admission_ok`, on by default) predicts each
+> incoming prefill's worst-case block footprint against the free pool and defers
+> admission when the pool is full, instead of dead-ending into empty batches. Batch
+> size > 1 at `max_model_len=512` therefore runs correctly: verified on device at
+> batch size 4 with all 24 requests completing in 41.6 s and **0 empty batches**. It
+> is a no-op when the pool has room, so it does not affect the `max_model_len=1024`
+> recipe. It can be disabled with `VLLM_NEURON_POOL_ADMISSION_GATE=0` (not
+> recommended for hybrid models with a tight `max_model_len`).
 >
 > Any change to the segmentation, sequence-length, or bucket configuration changes the
 > traced graph and triggers a full cold recompile, so freeze one recipe rather than
@@ -315,23 +369,16 @@ Per-request decode is approximately 21 tok/s at batch size 1.
 ## Contents of this bundle
 
 The model is integrated in-tree (committed directly on this branch), so the
-top-level `Qwen3.6-35B-A3B/` bundle is supplementary — it carries this
-source-of-truth README plus a standalone patch of the shared-file edits (for applying
-the model onto a *pristine* release tree). There is **no `src/` copy** here (that
-would duplicate the in-tree package).
+top-level `Qwen3.6-35B-A3B/` bundle is just this source-of-truth README. There is
+**no `src/` copy** here (that would duplicate the in-tree package).
 
 ```text
 Qwen3.6-35B-A3B/
-├── README.md            # This file — the source of truth for the port
-└── integration.patch    # The 7 shared-file edits as a standalone patch, for applying
-                         #   onto a pristine 0.21.0.1.0.0 tree (already committed
-                         #   in-tree here; kept for reference / out-of-tree installs)
+└── README.md            # This file — the source of truth for the Qwen3.6-35B-A3B port
 ```
 
-The self-contained hybrid-pool livelock regression test and the tested run recipes
-(`RUN_CONFIGS`) used during bring-up are kept internal under
-`INTERNAL/bringup-benches/` (not part of the public bundle); their validated config
-and measured values are transcribed into **Serving** / **Measured performance** above.
+The paths the port touches are listed below; that listing is the record of which shared
+framework files this model changes.
 
 ### Paths this port touches across the repository
 

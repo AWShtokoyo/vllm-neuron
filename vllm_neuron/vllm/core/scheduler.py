@@ -987,6 +987,11 @@ class NeuronScheduler(Scheduler):
 
         # Step 3: Separate prefill/decode
         running_holdback: list[Request] = []
+        # Whether THIS schedule() call hid decode requests to run a prefill-only step
+        # (branch 3.1 = mid-chunk prefill in running; branch 3.2 = new waiting prefill).
+        # Either way, if the prefill-only step comes back with 0 scheduled tokens we can
+        # safely fall back to a DECODE-ONLY step over the hidden decodes (empty-batch fix).
+        _hid_decodes_for_prefill = False
         if self.has_prefill_in_running:
             # 3.1 Ongoing prefill segments in running queue - hide decode requests
             running_holdback = [
@@ -995,6 +1000,8 @@ class NeuronScheduler(Scheduler):
             self.running = [
                 req for req in self.running if self._is_prefill_request(req)
             ]
+            # Only mark for the decode-only fallback if we actually hid some decodes.
+            _hid_decodes_for_prefill = len(running_holdback) > 0
             logger.debug(
                 "Scheduling prefill step: keeping %d prefill in running, "
                 "hiding %d decode, %d in waiting, %d in holdback",
@@ -1007,6 +1014,7 @@ class NeuronScheduler(Scheduler):
             # 3.2 New requests waiting for prefill - hide decode requests
             running_holdback = self.running
             self.running = []
+            _hid_decodes_for_prefill = len(running_holdback) > 0
             logger.debug(
                 "Scheduling prefill step: %s request(s), "
                 "holding back %s waiting, %s running",
@@ -1029,6 +1037,10 @@ class NeuronScheduler(Scheduler):
         # `assert len(self.running) <= self.max_num_running_reqs`.
         # finally: max_num_running_reqs persists on the instance, so a raise
         # from _call_base_schedule must not leave it permanently decremented.
+        _pre_running = len(self.running)
+        _pre_waiting = len(self.waiting)
+        _pre_holdback = len(self.holdback_queue)
+        _pre_holdback_running = len(running_holdback)
         hidden_count = len(running_holdback)
         if hidden_count > 0:
             self.max_num_running_reqs -= hidden_count
@@ -1037,6 +1049,61 @@ class NeuronScheduler(Scheduler):
         finally:
             if hidden_count > 0:
                 self.max_num_running_reqs += hidden_count
+
+        # EMPTY-BATCH LIVELOCK FALLBACK: a prefill-only step (branch 3.1 mid-chunk prefill,
+        # or 3.2 new waiting prefill) can come back with 0 scheduled tokens — e.g. the
+        # prefill couldn't allocate blocks / advance its next chunk this step. Because we
+        # hid the decodes, the base scheduler had nothing else to schedule, so it returns an
+        # empty batch. EngineCore then loops forever on the 0-token step (core.py
+        # sleep(0.001) + has_unfinished_requests) while workers spin in shm dequeue.
+        # FIX: if a prefill-oriented step produced 0 tokens but we have decodes held back,
+        # run a DECODE-ONLY step over those decodes instead. Decode-only is a legal Neuron
+        # step (no prefill/decode mixing), guarantees forward progress, and defers the
+        # blocked prefill one step. Works for BOTH branches: hide ALL prefills (the mid-chunk
+        # prefill from 3.1 lives in self.running; new prefills are in self.waiting) into
+        # holdback, restore the decodes, and re-run base as decode-only.
+        #
+        # This is the LAST-RESORT complement to _pool_admission_ok(): the gate DEFERS a
+        # prefill before it can saturate the hybrid state pool (preventing the stall), while
+        # this fallback guarantees progress if a 0-token prefill step happens anyway.
+        if (
+            not scheduler_output.total_num_scheduled_tokens
+            and _hid_decodes_for_prefill
+            and _pre_holdback_running > 0
+        ):
+            logger.warning(
+                "[EMPTY-BATCH] prefill-only step scheduled 0 tokens "
+                "(pre_running=%d waiting=%d holdback=%d held_decodes=%d); falling "
+                "back to decode-only step to avoid livelock.",
+                _pre_running, _pre_waiting, _pre_holdback, _pre_holdback_running,
+            )
+            # Temporarily hide any prefill reqs still in self.running (branch 3.1 mid-chunk
+            # prefill, status==RUNNING) so the decode-only re-run does NOT mix prefill+decode.
+            # These must be restored to self.RUNNING (NOT waiting — the base scheduler's
+            # waiting loop assumes status==WAITING and would mishandle a RUNNING req), so we
+            # stash them separately and re-append after the re-run.
+            deferred_running_prefills = [
+                r for r in self.running if self._is_prefill_request(r)
+            ]
+            self.running = [
+                r for r in self.running if not self._is_prefill_request(r)
+            ]
+            # Restore the hidden decodes as the running set for the decode-only re-run.
+            self.running = self.running + running_holdback
+            running_holdback = deferred_running_prefills  # Step 5 re-appends to running
+            # Hide new waiting prefills (branch 3.2, status==WAITING) in holdback; Step 5
+            # restores them to self.waiting so they retry next step.
+            while self.waiting:
+                self.holdback_queue.append(self.waiting.popleft())
+            # Re-apply the same hidden-capacity correction as above for the re-run.
+            hidden_count = len(running_holdback)
+            if hidden_count > 0:
+                self.max_num_running_reqs -= hidden_count
+            try:
+                scheduler_output = self._call_base_schedule()
+            finally:
+                if hidden_count > 0:
+                    self.max_num_running_reqs += hidden_count
 
         # DIAGNOSTIC (default-OFF): when VLLM_NEURON_SCHED_DIAG=1, log why a
         # schedule() step produced an empty batch while requests are unfinished

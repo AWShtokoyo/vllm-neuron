@@ -5506,33 +5506,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             if os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1" and _cs.raw_slabs:
                 # emit raw int32 (src,dst) block-id vectors into each GDN layer's metadata;
                 # the model forward anchors + consumes them via .ap gather/scatter. -1 = skip.
+                # {gid: (src_list, dst_list)} | None — the shared BlockPool hands each recurrent
+                # group DISJOINT block ids, so a layer MUST use its OWN group's pair (using group
+                # 0's ids for all layers left groups 1..N-1 unmigrated -> silent state reset;
+                # see CARRY_FORWARD_GROUP_BUG).
                 _cf = collect_carry_forward_ids(
                     scheduler_output, self.mamba_state_idx, self.input_batch,
-                    self.requests, _cs, self.device, int(self.max_num_reqs),
+                    self.requests, _cs,
                 )
                 # ALWAYS inject the keys (all -1 when no carry) so the key is PRESENT on EVERY
                 # invocation, and size the row count to the SAME per-layer batch dim as
                 # state_indices (the graph guards carry row-count against its batch; a fixed
                 # max_num_reqs mismatches the prefill graph -> fail_on_recompile). Pad the real
-                # (src,dst) pairs to that length with -1 (skip).
+                # (src,dst) pairs to that length with -1 (skip). Injected BY GROUP MEMBERSHIP:
+                # all layers of a group share ONE metadata dict object, so writing via any of the
+                # group's layer_names updates every layer in that group.
                 if attn_metadata is not None:
-                    _pairs = None
-                    if _cf is not None:
-                        _pairs = (_cf[0].reshape(-1).tolist(), _cf[1].reshape(-1).tolist())
-                    for _ln, _md in attn_metadata.items():
-                        if not (isinstance(_md, dict) and "linear_attn" in _ln):
+                    for gid in _cs.mamba_group_ids:
+                        _grp = self.kv_cache_config.kv_cache_groups[gid]
+                        _md = attn_metadata.get(_grp.layer_names[0])
+                        if not isinstance(_md, dict):
                             continue
                         _si = _md.get("state_indices")
                         _n = int(_si.shape[0]) if _si is not None else int(self.max_num_reqs)
                         _src = torch.full((_n, 1), -1, dtype=torch.int32, device=self.device)
                         _dst = torch.full((_n, 1), -1, dtype=torch.int32, device=self.device)
-                        if _pairs is not None:
-                            _k = min(len(_pairs[0]), _n)
+                        _pair = (_cf or {}).get(gid)
+                        if _pair is not None:
+                            _k = min(len(_pair[0]), _n)
                             if _k > 0:
-                                _src[:_k, 0] = torch.tensor(_pairs[0][:_k], dtype=torch.int32, device=self.device)
-                                _dst[:_k, 0] = torch.tensor(_pairs[1][:_k], dtype=torch.int32, device=self.device)
-                        _md["carry_src_ids"] = _src
-                        _md["carry_dst_ids"] = _dst
+                                _src[:_k, 0] = torch.tensor(_pair[0][:_k], dtype=torch.int32, device=self.device)
+                                _dst[:_k, 0] = torch.tensor(_pair[1][:_k], dtype=torch.int32, device=self.device)
+                        for _ln in _grp.layer_names:
+                            _mdl = attn_metadata.get(_ln)
+                            if isinstance(_mdl, dict):
+                                _mdl["carry_src_ids"] = _src
+                                _mdl["carry_dst_ids"] = _dst
             else:
                 preprocess_mamba_neuron(
                     scheduler_output,
@@ -8389,8 +8398,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 # by position) so align-mode block indexing works. Emit the
                 # framework-computed cache_config.mamba_block_size (defaults to
                 # cache_config.block_size when APC on — models/config.py:397-398).
-                # Non-APC → block_size=1 (BYTE-IDENTICAL to today; the proven
-                # single-row-per-seq slot path). Gate strictly on APC/align.
+                # Non-APC → block_size = max_model_len (whole seq in ONE block;
+                # required by the single-slot block_table[:,0] state read — see the
+                # inline note in the else branch below; block_size=256 was
+                # device-disproven, corrupts logits). Gate strictly on APC/align.
                 _cc = self.vllm_config.cache_config
                 _mamba_mode = getattr(_cc, 'mamba_cache_mode', 'none')
                 _apc = getattr(_cc, 'enable_prefix_caching', False) or _mamba_mode == 'align'
@@ -8402,7 +8413,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         _mbs = max(8, (int(block_size) // 8) * 8)
                     mamba_block_size = int(_mbs)
                 else:
-                    mamba_block_size = 1
+                    # Non-APC ('none' mode): mamba block_size = max_model_len so the WHOLE
+                    # sequence lives in ONE block. The SSM/GDN recurrent state is O(1) per
+                    # sequence (one fixed state slab); the runtime GDN state addressing reads
+                    # a SINGLE slot (block_table[:,0], guarded by _mamba_apc_enabled()) for
+                    # non-APC regardless of block_size. So the whole prefix state MUST fit
+                    # in block 0 -> block_size must span the full sequence.
+                    #
+                    # DO NOT shrink this to the upstream-aligned cache_config.block_size (256):
+                    # DEVICE-DISPROVEN 2026-07-21 — block_size=256 makes seq1024 span 4 blocks
+                    # (cdiv(1024,256)=4), but the single-slot state read only sees block 0 ->
+                    # garbage logits (seq1024-bs1-seg512 went 0.67 -> Tgt/Base 17-87x, BC ~0.2,
+                    # EVERY token divergent). The bounded-page theory ignored the runtime
+                    # single-slot gather contract. block_size=1 is the other failure mode:
+                    # cdiv(N,1)=N mamba blocks/req -> pool exhausted -> scheduler wedge (this is
+                    # the same over-admission the _pool_admission_ok() gate defends against).
+                    # max_model_len is the only value satisfying the single-slot contract.
+                    #
+                    # The long-context OOM (maxlen8192) is a SEPARATE concern solved by
+                    # --num-gpu-blocks-override (caps the KV/state block pool), NOT by
+                    # shrinking block_size (which corrupts state addressing).
+                    mamba_block_size = int(
+                        getattr(_cc, 'mamba_block_size', None) or self.max_model_len
+                    )
                 # SPEC-DECODE B3: reserve draft-token state capacity in the
                 # paged mamba pool. Upstream (mamba/abstract.py
                 # get_kv_cache_spec) sets num_speculative_blocks =

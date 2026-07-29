@@ -802,10 +802,25 @@ class Qwen3_5FullAttention(nn.Module):
             K_gathered = K_g.permute(0, 2, 1, 3, 4).reshape(B, nkh, S_ctx, self.head_dim)
             V_gathered = V_g.permute(0, 2, 1, 3, 4).reshape(B, nkh, S_ctx, self.head_dim)
 
-            # Scatter live (post-RoPE) new K/V into the window at each token's true position.
+            # Scatter live (post-RoPE) new K/V into the window at each token's slot.
             k_bnsd = k.reshape(nkh, B, S_q, self.head_dim).permute(1, 0, 2, 3)
             v_bnsd = v.reshape(nkh, B, S_q, self.head_dim).permute(1, 0, 2, 3)
-            scatter_pos = positions.long().view(B, 1, S_q, 1).expand(B, nkh, S_q, self.head_dim)
+            # PADDING-AWARE SCATTER (matches the GDN path's argmax(positions) guard):
+            # the runner RIGHT-pads prefill with padding tokens whose `positions` REPEAT
+            # the last real position (confirmed: positions=[base..L-1, L-1, L-1, ...]).
+            # Scattering by the raw (clamped) `positions` makes every padding token target
+            # the SAME slot as the real last token; torch.scatter is last-writer-wins on
+            # duplicate indices, so padding (later in sequence order) OVERWRITES the real
+            # last token's self-K/V -> only the last token gets a corrupted self-key, only
+            # under segmentation. Fix: target by SEQUENCE-ORDER slot (base + arange), which
+            # equals `positions` for real tokens but gives padding UNIQUE slots beyond the
+            # last real position — slots the absolute-position causal mask below already
+            # excludes (gathered_idx <= query_pos). No collision -> real last token intact.
+            seq_slot = (
+                positions[:1].long()
+                + torch.arange(S_q, device=hidden_states.device, dtype=torch.long)
+            ).clamp_(max=S_ctx - 1)
+            scatter_pos = seq_slot.view(B, 1, S_q, 1).expand(B, nkh, S_q, self.head_dim)
             K_gathered = K_gathered.scatter(2, scatter_pos, k_bnsd.to(K_gathered.dtype))
             V_gathered = V_gathered.scatter(2, scatter_pos, v_bnsd.to(V_gathered.dtype))
 
@@ -1348,10 +1363,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         GATE: activates purely on the presence of the APC metadata keys
         (``seed_state_indices`` + ``has_initial_state``), which the runner emits
         ONLY under ``_mamba_apc_enabled()`` (enable_prefix_caching / align). So
-        non-APC (keys absent) -> None -> byte-identical. VLLM_GDN_APC_SEED=0 is
-        an explicit device-iteration disable escape hatch (default: active)."""
-        if os.environ.get("VLLM_GDN_APC_SEED") == "0":
-            return None
+        non-APC (keys absent) -> None -> byte-identical.
+
+        The seed is ALWAYS ON when the APC metadata is present — there is no point
+        NOT reading the precomputed prefix state from the cache — so there is no env
+        short-circuit here; seeding activates purely on metadata presence (APC-only
+        by construction), and the guards below keep non-APC byte-identical."""
         if attn_metadata is None or self.recurrent_state is None:
             return None
         md = attn_metadata.get(f"layers.{self.layer_idx}.linear_attn")
@@ -1392,8 +1409,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             P = (seed_idx.view(1, 1) == slots.view(1, N)).to(torch.float32)   # [1, N]
             sflat = self.recurrent_state.reshape(N, -1).to(torch.float32)
             seed = (P @ sflat).reshape(1, *self.recurrent_state.shape[1:])     # [1, *tail]
-        # Mask: fresh request (has_init=0) -> zeros == initial_state None.
-        out = seed * has_init
+        # Mask: fresh request (has_init=0) -> zeros == initial_state None. NaN-SAFE SELECT:
+        # a genuinely-cold request gathers an UNALLOCATED seed block whose bytes may be
+        # NaN/Inf; `seed * 0 = NaN` would poison the S0-fold (P0@S0) and diverge from the
+        # APC-off single-slot path. torch.where SELECTS the zero branch (no arithmetic on the
+        # poisoned value) -> exact zeros for a cold request, real seed for a cache-hit resume.
+        out = torch.where(has_init.to(torch.bool), seed, torch.zeros_like(seed))
         return out
 
     def _apc_conv_seed(self, attn_metadata, device):
@@ -1405,9 +1426,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         causal_conv1d_fn(has_initial_state=..., cache_indices=[:,0]) which restores the prior
         conv window on a cache hit; without it prefill zero-left-pads and loses the prefix's
         last k-1 conv inputs. Returns None when APC off / keys absent (byte-identical fallback).
-        """
-        if os.environ.get("VLLM_GDN_APC_SEED") == "0":
-            return None
+
+        ALWAYS ON when APC metadata is present (mirrors _apc_prefill_seed): the precomputed
+        conv window is always restored from cache on a hit; the metadata-presence guards
+        below keep non-APC byte-identical."""
         if attn_metadata is None or self.conv_state is None:
             return None
         md = attn_metadata.get(f"layers.{self.layer_idx}.linear_attn")
@@ -1446,7 +1468,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cflat = self.conv_state.reshape(N, -1).to(torch.float32)
             seed = (P @ cflat).reshape(1, self.conv_dim_local, k1)             # [1, conv_dim_local, k-1]
         has_init = has_init.reshape(1, 1, 1)
-        return (seed * has_init).to(self.conv_state.dtype)
+        # NaN-SAFE SELECT: mirror _apc_prefill_seed — a cold request gathers an unallocated
+        # conv block (garbage/NaN); `seed * 0 = NaN` would poison the conv-window cat.
+        # torch.where selects exact zeros for a cold request, real window for a resume.
+        out = torch.where(has_init.to(torch.bool), seed, torch.zeros_like(seed))
+        return out.to(self.conv_state.dtype)
 
     def _carry_forward(self, attn_metadata) -> None:
         """IN-GRAPH block->block state carry-forward (task #106): move each request's running
