@@ -1295,8 +1295,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
             hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
+        # VLLM_NEURON_AUTOCAST controls --auto-cast= (default 'none' matches
+        # neuronx-cc's default; set to 'matmult' to enable bf16 accumulation for
+        # matmul when the model tolerates it).
+        _auto_cast = os.environ.get("VLLM_NEURON_AUTOCAST", "none")
+        logger.info("Compile --auto-cast=%s", _auto_cast)
         self.compile_options["compiler_args"] = [
-            "--auto-cast=none",
+            f"--auto-cast={_auto_cast}",
             "--verbose=35",
             f"-O{self.vllm_config.optimization_level.value}",
             f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",

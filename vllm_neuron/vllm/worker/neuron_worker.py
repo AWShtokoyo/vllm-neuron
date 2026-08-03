@@ -412,6 +412,17 @@ class NeuronWorker(WorkerBase):
 
         neuron_visible_devices = os.getenv("NEURON_VISIBLE_DEVICES")
         neuron_visible_devices = parse_range_list(neuron_visible_devices)
+        # Single-chip fan-out: on instances with a single Neuron device that
+        # contains multiple logical cores (e.g. trn2.3xlarge has 1 device with
+        # 4 logical cores at LNC=2), all TP ranks share the single chip and
+        # each gets a distinct core via NEURON_RT_VISIBLE_CORES (set below).
+        # Replicate the device id so every rank sees the shared chip.
+        if len(neuron_visible_devices) == 1 and num_local_ranks > 1:
+            logger.info(
+                "Single-chip TP fan-out: %d ranks share device %s",
+                num_local_ranks, neuron_visible_devices,
+            )
+            neuron_visible_devices = neuron_visible_devices * num_local_ranks
         assert len(neuron_visible_devices) == num_local_ranks
         return neuron_visible_devices
 
@@ -520,9 +531,22 @@ class NeuronWorker(WorkerBase):
             # has one visible core, while the platform device count is the
             # number of visible cores on the local node.
             NeuronPlatform.set_device_count(len(visible_devices))
-            os.environ["NEURON_RT_VISIBLE_CORES"] = (
-                f"{visible_devices[self.local_rank]}"
-            )
+            # If several ranks share the same visible chip (single-chip fan-out
+            # on trn2.3xlarge etc.), each rank must own a distinct core on that
+            # chip. Compute the per-rank core id as this rank's position among
+            # the ranks that share the same chip. For the common one-rank-per-
+            # chip case the shared list contains only self.local_rank, so
+            # _rank_within_chip == 0 and NEURON_RT_VISIBLE_CORES falls back to
+            # the visible chip id -- unchanged from the previous behavior.
+            _visible_chip = visible_devices[self.local_rank]
+            _same_chip_ranks = [
+                i for i, d in enumerate(visible_devices) if d == _visible_chip
+            ]
+            if len(_same_chip_ranks) > 1:
+                _core_id = _same_chip_ranks.index(self.local_rank)
+            else:
+                _core_id = _visible_chip
+            os.environ["NEURON_RT_VISIBLE_CORES"] = f"{_core_id}"
 
             # Enable HBM mapping (required for RDMA in disaggregated
             # inference and other use cases)
