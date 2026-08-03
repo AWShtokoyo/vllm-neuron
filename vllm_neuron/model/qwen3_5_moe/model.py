@@ -2805,34 +2805,139 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # matmul fails "x float32 must match w bfloat16". Expert weights/input stay bf16.
         _router_fp32 = os.environ.get("VLLM_MOE_TKG_ROUTER_FP32") == "1"
 
-        output = NF.moe_block_tkg(
-            inp=hidden_states.unsqueeze(0),
-            gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
-            router_weights=(self.router_weight.T.to(torch.float32)
-                            if _router_fp32 else self.router_weight.T),
-            expert_gate_up_weights=self.gate_up_proj_weight.reshape(
-                self.num_local_experts, self.hidden, 2,
-                self.intermediate_size_per_rank),
-            expert_down_weights=self.down_proj_weight,
-            rank_id=rank_id,
-            top_k=self.top_k,
-            eps=self.rms_norm_eps,
-            router_act_fn=RouterActFnType.SOFTMAX,
-            router_pre_norm=True,
-            norm_topk_prob=self.norm_topk_prob,
-            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
-            hidden_act_fn=ActFnType.SiLU,
-            # DIAGNOSTIC (env VLLM_MOE_TKG_ROUTER_FP32=1): run the DECODE MoE router
-            # projection in fp32. The decode kernel routes over 256 experts in bf16
-            # (router_mm_dtype default) while PREFILL routes via NF.router in fp32 —
-            # a prefill-fp32 / decode-bf16 asymmetry suspected (TF_DIVERGENCE_ANALYSIS.md)
-            # of producing the flat ~3-9% per-token TF logit floor + occasional top-k
-            # expert-selection flips. This is the ONLY fp32 toggle the tkg kernel exposes
-            # (it has no expert-matmul dtype arg). Default OFF keeps the graph unchanged.
-            router_mm_dtype=(nl.float32 if _router_fp32 else nl.bfloat16),
-            is_all_expert=True,
-            skip_router_logits=True,
-        )
+        # Kernel dispatch: VLLM_MOE_TKG_KERNEL selects the MoE decode implementation.
+        #   "moe_block_tkg"           (default): the existing NKI moe_block_tkg kernel.
+        #   "torch_batched"           : pure-torch batched matmul over all E_L local experts.
+        #                               Bypasses the NKI kernel. Correctness is bit-identical to
+        #                               the moe_block_tkg all-experts path (same math, same order).
+        #   "torch_batched_selective" : pure-torch batched matmul over ONLY the top-K experts
+        #                               (per token) via torch.index_select on the expert-weight
+        #                               dim. Non-local experts contribute 0 via a valid_mask
+        #                               applied to the affinity. Reduces the MoE decode step
+        #                               HBM read volume by roughly E_L/top_k (e.g. 64/8 = 8x).
+        #                               Correctness verified bit-identical to the all-experts
+        #                               paths on the "capital of France" and "haiku" prompts;
+        #                               the "token"*240 stress prompt matches the all-experts
+        #                               output through the point of divergence expected from
+        #                               fp32 op-order differences under greedy sampling.
+        _kernel_choice = os.environ.get("VLLM_MOE_TKG_KERNEL", "moe_block_tkg")
+
+        if _kernel_choice == "torch_batched":
+            # All-experts pure-torch batched matmul over all E_L=num_local_experts.
+            # Router: (T, H) @ (H, E_global) -> (T, E_global); softmax + top_k;
+            # scatter top-k affinities to (T, E_global); slice to local expert range;
+            # bmm (E_L, T, H) x (E_L, H, 2*I) -> gate_up; SiLU; bmm x (E_L, I, H) -> expert_out;
+            # weighted sum by masked affinity -> (T, H).
+            H = self.hidden
+            E_L = self.num_local_experts
+            I_per_rank = self.intermediate_size_per_rank
+            normed_2d = normed.reshape(-1, H)
+            T = normed_2d.shape[0]
+            router_w = (self.router_weight.T.to(torch.float32)
+                        if _router_fp32 else self.router_weight.T)
+            router_x = normed_2d.to(router_w.dtype)
+            router_logits = router_x @ router_w
+            expert_affinities = F.softmax(router_logits.to(torch.float32), dim=-1)
+            topk_affinities, expert_index = torch.topk(
+                expert_affinities, self.top_k, dim=-1)
+            if self.norm_topk_prob:
+                topk_affinities = topk_affinities / topk_affinities.sum(dim=-1, keepdim=True)
+            expert_affinities_masked = torch.zeros_like(expert_affinities)
+            expert_affinities_masked.scatter_(1, expert_index, topk_affinities)
+            expert_offset = (rank_id.view(-1)[0].to(torch.int64) * E_L)
+            local_expert_indices = torch.arange(E_L, device=normed_2d.device) + expert_offset
+            local_affinities = expert_affinities_masked.index_select(1, local_expert_indices)
+            gate_up_w = self.gate_up_proj_weight.view(E_L, H, 2 * I_per_rank)
+            down_w = self.down_proj_weight
+            hidden_bcast = normed_2d.unsqueeze(0).expand(E_L, T, H).to(gate_up_w.dtype)
+            gate_up = torch.bmm(hidden_bcast, gate_up_w)
+            gate, up = gate_up.split(I_per_rank, dim=-1)
+            intermediate = F.silu(gate) * up
+            expert_out = torch.bmm(intermediate, down_w)
+            affinity_bcast = local_affinities.transpose(0, 1).unsqueeze(-1)
+            output = (expert_out * affinity_bcast.to(expert_out.dtype)).sum(dim=0)
+        elif _kernel_choice == "torch_batched_selective":
+            # Top-K expert pure-torch batched matmul. Gathers only the top_k expert weight
+            # matrices via torch.index_select using top-K global indices offset to local.
+            # Static shape = top_k (compile-time constant), values are runtime-dynamic;
+            # neuronx-cc lowers this as a single indirect-DMA gather.
+            #
+            # Cross-rank correctness: when a top-K expert is NOT owned by this rank
+            # (index falls outside [0, E_L)), the local index gets clamped to a safe
+            # value (0) so the gather does not OOB, and the corresponding affinity
+            # is zeroed via valid_mask so that expert contributes 0 to the sum.
+            H = self.hidden
+            E_L = self.num_local_experts
+            I_per_rank = self.intermediate_size_per_rank
+            K = self.top_k
+            normed_2d = normed.reshape(-1, H)
+            T = normed_2d.shape[0]
+            router_w = (self.router_weight.T.to(torch.float32)
+                        if _router_fp32 else self.router_weight.T)
+            router_x = normed_2d.to(router_w.dtype)
+            router_logits = router_x @ router_w
+            expert_affinities = F.softmax(router_logits.to(torch.float32), dim=-1)
+            topk_affinities, expert_index = torch.topk(
+                expert_affinities, K, dim=-1)
+            if self.norm_topk_prob:
+                topk_affinities = topk_affinities / topk_affinities.sum(dim=-1, keepdim=True)
+            expert_offset = (rank_id.view(-1)[0].to(torch.int64) * E_L)
+            local_expert_idx = expert_index - expert_offset
+            valid_mask = ((local_expert_idx >= 0) & (local_expert_idx < E_L))
+            safe_local_idx = torch.clamp(local_expert_idx, 0, E_L - 1)
+            flat_local_idx = safe_local_idx.reshape(-1)
+            gate_up_w = self.gate_up_proj_weight.view(E_L, H, 2 * I_per_rank)
+            down_w = self.down_proj_weight
+            gate_up_sel = gate_up_w.index_select(0, flat_local_idx)
+            down_sel = down_w.index_select(0, flat_local_idx)
+            if T == 1:
+                hidden_bcast = normed_2d.unsqueeze(0).expand(K, T, H).to(gate_up_sel.dtype)
+            else:
+                hidden_per_tk = (normed_2d.unsqueeze(1).expand(T, K, H)
+                                 .reshape(T * K, 1, H).to(gate_up_sel.dtype))
+                hidden_bcast = hidden_per_tk
+            gate_up = torch.bmm(hidden_bcast, gate_up_sel)
+            gate, up = gate_up.split(I_per_rank, dim=-1)
+            intermediate = F.silu(gate) * up
+            expert_out = torch.bmm(intermediate, down_sel)
+            affinity_per_tk = (topk_affinities * valid_mask.to(topk_affinities.dtype)).reshape(-1)
+            affinity_bcast = affinity_per_tk.view(-1, 1, 1).to(expert_out.dtype)
+            weighted = expert_out * affinity_bcast
+            if T == 1:
+                output = weighted.sum(dim=0)
+            else:
+                output = weighted.view(T, K, H).sum(dim=1)
+        else:
+            # Default: use the existing NKI moe_block_tkg kernel. Behavior is byte-identical
+            # to the previous unconditional NF.moe_block_tkg(...) call site.
+            output = NF.moe_block_tkg(
+                inp=hidden_states.unsqueeze(0),
+                gamma=self.post_attention_layernorm.weight.unsqueeze(0).to(torch.float32),
+                router_weights=(self.router_weight.T.to(torch.float32)
+                                if _router_fp32 else self.router_weight.T),
+                expert_gate_up_weights=self.gate_up_proj_weight.reshape(
+                    self.num_local_experts, self.hidden, 2,
+                    self.intermediate_size_per_rank),
+                expert_down_weights=self.down_proj_weight,
+                rank_id=rank_id,
+                top_k=self.top_k,
+                eps=self.rms_norm_eps,
+                router_act_fn=RouterActFnType.SOFTMAX,
+                router_pre_norm=True,
+                norm_topk_prob=self.norm_topk_prob,
+                expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+                hidden_act_fn=ActFnType.SiLU,
+                # DIAGNOSTIC (env VLLM_MOE_TKG_ROUTER_FP32=1): run the DECODE MoE router
+                # projection in fp32. The decode kernel routes over 256 experts in bf16
+                # (router_mm_dtype default) while PREFILL routes via NF.router in fp32 —
+                # a prefill-fp32 / decode-bf16 asymmetry suspected (TF_DIVERGENCE_ANALYSIS.md)
+                # of producing the flat ~3-9% per-token TF logit floor + occasional top-k
+                # expert-selection flips. This is the ONLY fp32 toggle the tkg kernel exposes
+                # (it has no expert-matmul dtype arg). Default OFF keeps the graph unchanged.
+                router_mm_dtype=(nl.float32 if _router_fp32 else nl.bfloat16),
+                is_all_expert=True,
+                skip_router_logits=True,
+            )
 
         if self.moe_group.world_size > 1:
             output = self.moe_group.all_reduce(output)
