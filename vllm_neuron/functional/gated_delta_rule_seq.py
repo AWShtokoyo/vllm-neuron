@@ -86,10 +86,20 @@ def gdn_seq_prefill_kernel(q_h, k_h, v_h, g_h, beta_h, H, T, D, init_state_h=Non
         # broadcast, contraction K=1, no DGE). Done ONCE per head, sliced per step.
         ones_D1 = nl.ndarray((1, D), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=ones_D1, value=1.0)
-        gD_ps = nl.ndarray((D, T), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=gD_ps, stationary=ones_D1, moving=gexp)   # [D,1]^T? -> see note
         gD = nl.ndarray((D, T), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=gD, src=gD_ps)
+        # SAN-SEQ-TILE-FIX: two gen3/trn2 limits force tiling this decay broadcast when T>512:
+        #   (1) nc_matmul moving free-dim <= 512 -> "Matmul moving free dimension T exceeds 512".
+        #   (2) a PSUM bank holds <= 512 fp32 columns, so a [D,T>512] PSUM tile is illegal.
+        # It is a pure K=1 broadcast (ones[1,D]^T @ gexp[1,T] -> [D,T]), so computing it in
+        # <=512-wide T slices through a 512-wide PSUM scratch and copying each slice into the
+        # SBUF gD[D,T] (SBUF free dim up to 32767) is numerically identical.
+        _MM_FREE_MAX = 512
+        for _t0 in range(0, T, _MM_FREE_MAX):
+            _tw = min(_MM_FREE_MAX, T - _t0)
+            _gD_ps = nl.ndarray((D, _tw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=_gD_ps, stationary=ones_D1,
+                           moving=gexp[0:1, nl.ds(_t0, _tw)])
+            nisa.tensor_copy(dst=gD[0:D, nl.ds(_t0, _tw)], src=_gD_ps)
 
         # recurrent state S [Dk, Dv] on partition=Dk. APC: seed from init_state_h[h] when provided
         # (a cache-hit prefix's saved boundary state), else zero. HAS_INIT is a compile-time flag so
