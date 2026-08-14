@@ -68,12 +68,14 @@ class Qwen3_5TextConfig:
     torch_dtype: torch.dtype = torch.bfloat16
     vocab_size: int = 248320
 
-    # MoE parameters (Qwen3.6-35B-A3B: 256 experts, top-8, + shared expert)
-    num_experts: int = 256
-    num_experts_per_tok: int = 8
-    moe_intermediate_size: int = 512
-    shared_expert_intermediate_size: int = 512
+    # DENSE-CONFIG: MoE params default None so a dense variant (Qwen3.5-9B, whose
+    # HF config lacks num_experts) leaves them unset -> decoder builds the dense MLP.
+    num_experts: int | None = None
+    num_experts_per_tok: int | None = None
+    moe_intermediate_size: int | None = None
+    shared_expert_intermediate_size: int | None = None
     norm_topk_prob: bool = True
+    intermediate_size: int | None = None  # dense FFN size (9B: 12288)
 
     # Linear attention (Gated DeltaNet) parameters
     full_attention_interval: int = 4

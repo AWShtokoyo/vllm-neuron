@@ -2670,6 +2670,72 @@ class Qwen3_5MoePlainRMSNorm(nn.Module):
         return F.rms_norm(x, self.weight.shape, self.weight, self.eps)
 
 
+class Qwen3_5DenseMLP(nn.Module):
+    """Dense SwiGLU FFN for non-MoE Qwen3.5 (e.g. Qwen3.5-9B). Drop-in for the
+    MoE block: folds post_attention_layernorm and matches
+    forward(hidden_states, positions, is_decode, rank). gate/up column-parallel,
+    down row-parallel (all_reduce the partial). Weights stored HF [out,in],
+    consumed transposed by NF.mlp."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.tp_group = get_tp_group()
+        self.world_size = self.tp_group.world_size
+        self.hidden = c.hidden_size
+        self.rms_norm_eps = c.rms_norm_eps
+        dt = c.torch_dtype
+        self.dtype = dt
+        inter = c.intermediate_size
+        assert inter % self.world_size == 0
+        self.inter_per_rank = inter // self.world_size
+        self.post_attention_layernorm = Qwen3_5MoePlainRMSNorm(
+            self.hidden, self.rms_norm_eps, dt)
+        self.gate_proj_weight = nn.Parameter(
+            torch.empty(self.hidden, self.inter_per_rank, dtype=dt))
+        self.up_proj_weight = nn.Parameter(
+            torch.empty(self.hidden, self.inter_per_rank, dtype=dt))
+        self.down_proj_weight = nn.Parameter(
+            torch.empty(self.inter_per_rank, self.hidden, dtype=dt))
+        self._setup_weight_loaders()
+
+    def _setup_weight_loaders(self):
+        set_weight_loader(
+            self.post_attention_layernorm.weight,
+            SafetensorsWeightLoader(transform=lambda s, r: s[0][:] + 1.0),
+        )
+        set_weight_loader(self.gate_proj_weight, sharding_weight_loader(
+            shard_dim=1, shard_size=self.inter_per_rank,
+            num_shards=self.world_size, is_storage_transposed=True))
+        set_weight_loader(self.up_proj_weight, sharding_weight_loader(
+            shard_dim=1, shard_size=self.inter_per_rank,
+            num_shards=self.world_size, is_storage_transposed=True))
+        set_weight_loader(self.down_proj_weight, sharding_weight_loader(
+            shard_dim=0, shard_size=self.inter_per_rank,
+            num_shards=self.world_size, is_storage_transposed=True))
+
+    def forward(self, hidden_states, positions, is_decode, rank):
+        hidden_states = hidden_states.to(self.dtype)
+        # SP: prefill all_gather -> MLP -> reduce_scatter (mirror MoE block); decode all_reduce.
+        if not is_decode and self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+        out = NF.mlp(
+            hidden_states,
+            gate_w=self.gate_proj_weight,
+            up_w=self.up_proj_weight,
+            down_w=self.down_proj_weight,
+            eps=self.rms_norm_eps,
+            ln_w=self.post_attention_layernorm.weight.view(1, self.hidden),
+            act_fn=ActFnType.SiLU,
+            norm_type=NormType.RMS_NORM,
+        )
+        if self.world_size > 1:
+            if is_decode:
+                out = self.tp_group.all_reduce(out)
+            else:
+                out = self.tp_group.reduce_scatter(out, dim=0)
+        return out.to(self.dtype)
+
+
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
     """256-expert top-8 sparse MoE + sigmoid-gated shared expert, static-block
     NF kernels with TP/EP. Ported self-contained from qwen3_5_moe/model_bf16.py.
@@ -3006,7 +3072,11 @@ class Qwen3_5FullAttentionDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
         self.self_attn = Qwen3_5FullAttention(config, layer_idx=layer_idx)
-        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        # num_experts in its config (full): dense vs MoE FFN selection.
+        if getattr(config, "num_experts", None):
+            self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen3_5DenseMLP(config)
         self.layer_idx = layer_idx
 
     def forward(
@@ -3046,7 +3116,11 @@ class Qwen3_5LinearAttentionDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx=layer_idx)
-        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        # num_experts in its config (linear): dense vs MoE FFN selection.
+        if getattr(config, "num_experts", None):
+            self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen3_5DenseMLP(config)
         self.layer_idx = layer_idx
 
     def forward(
@@ -3565,14 +3639,19 @@ class Qwen3_5ForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Suppor
             mappings[f"{model_prefix}.input_layernorm.weight"] = f"{hf_prefix}.input_layernorm.weight"
             mappings[f"{model_prefix}.mlp.post_attention_layernorm.weight"] = f"{hf_prefix}.post_attention_layernorm.weight"
 
-            # MoE block (router + fused experts + shared expert) — every layer.
-            mappings[f"{model_prefix}.mlp.router_weight"] = f"{hf_prefix}.mlp.gate.weight"
-            mappings[f"{model_prefix}.mlp.gate_up_proj_weight"] = f"{hf_prefix}.mlp.experts.gate_up_proj"
-            mappings[f"{model_prefix}.mlp.down_proj_weight"] = f"{hf_prefix}.mlp.experts.down_proj"
-            mappings[f"{model_prefix}.mlp.shared_gate_proj"] = f"{hf_prefix}.mlp.shared_expert.gate_proj.weight"
-            mappings[f"{model_prefix}.mlp.shared_up_proj"] = f"{hf_prefix}.mlp.shared_expert.up_proj.weight"
-            mappings[f"{model_prefix}.mlp.shared_down_proj"] = f"{hf_prefix}.mlp.shared_expert.down_proj.weight"
-            mappings[f"{model_prefix}.mlp.shared_expert_gate"] = f"{hf_prefix}.mlp.shared_expert_gate.weight"
+            # DENSE-WEIGHT-MAP: MoE vs dense FFN weight names.
+            if getattr(tc, "num_experts", None):
+                mappings[f"{model_prefix}.mlp.router_weight"] = f"{hf_prefix}.mlp.gate.weight"
+                mappings[f"{model_prefix}.mlp.gate_up_proj_weight"] = f"{hf_prefix}.mlp.experts.gate_up_proj"
+                mappings[f"{model_prefix}.mlp.down_proj_weight"] = f"{hf_prefix}.mlp.experts.down_proj"
+                mappings[f"{model_prefix}.mlp.shared_gate_proj"] = f"{hf_prefix}.mlp.shared_expert.gate_proj.weight"
+                mappings[f"{model_prefix}.mlp.shared_up_proj"] = f"{hf_prefix}.mlp.shared_expert.up_proj.weight"
+                mappings[f"{model_prefix}.mlp.shared_down_proj"] = f"{hf_prefix}.mlp.shared_expert.down_proj.weight"
+                mappings[f"{model_prefix}.mlp.shared_expert_gate"] = f"{hf_prefix}.mlp.shared_expert_gate.weight"
+            else:
+                mappings[f"{model_prefix}.mlp.gate_proj_weight"] = f"{hf_prefix}.mlp.gate_proj.weight"
+                mappings[f"{model_prefix}.mlp.up_proj_weight"] = f"{hf_prefix}.mlp.up_proj.weight"
+                mappings[f"{model_prefix}.mlp.down_proj_weight"] = f"{hf_prefix}.mlp.down_proj.weight"
 
             if tc.layer_types[layer_id] == "full_attention":
                 # Fused QKV (separate Q, K, V in checkpoint → fused in model)

@@ -24,6 +24,7 @@ def get_models() -> list[tuple[str, type]]:
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
         ("Qwen3_5MoeForConditionalGeneration", Qwen3_5MoeForConditionalGeneration),
         ("Qwen3_5MoeForCausalLM", Qwen3_5MoeForConditionalGeneration),
+        ("Qwen3_5ForConditionalGeneration", Qwen3_5MoeForConditionalGeneration),  # dense 9B
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural
