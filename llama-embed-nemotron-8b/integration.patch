@@ -1,0 +1,60 @@
+diff --git a/vllm_neuron/__init__.py b/vllm_neuron/__init__.py
+index c60d720..2dfcf2d 100644
+--- a/vllm_neuron/__init__.py
++++ b/vllm_neuron/__init__.py
+@@ -204,10 +204,35 @@ def register():
+     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
+ 
+     _patch_dcp_config_validation()
++    _register_llama_bidirec_hf_config()
+ 
+     return get_platform_class()
+ 
+ 
++def _register_llama_bidirec_hf_config() -> None:
++    """Register the LlamaBidirectional model_type with HuggingFace AutoConfig.
++
++    nvidia/llama-embed-nemotron-8b uses model_type ``llama_bidirec``, which is
++    not in the public transformers CONFIG_MAPPING. We register a minimal config
++    that subclasses LlamaConfig and carries the ``pooling``/``temperature``
++    fields, so vLLM's AutoConfig.from_pretrained() does not raise KeyError.
++    """
++    from transformers import AutoConfig
++    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
++    from transformers.models.llama.configuration_llama import LlamaConfig
++
++    class _LlamaBidirecHFConfig(LlamaConfig):
++        model_type = "llama_bidirec"
++
++        def __init__(self, pooling="avg", temperature=1.0, **kwargs):
++            self.pooling = pooling
++            self.temperature = temperature
++            super().__init__(**kwargs)
++
++    if "llama_bidirec" not in CONFIG_MAPPING:
++        AutoConfig.register("llama_bidirec", _LlamaBidirecHFConfig)
++
++
+ def __getattr__(name):
+     import importlib
+ 
+diff --git a/vllm_neuron/model/registry.py b/vllm_neuron/model/registry.py
+index 8b90af3..b362000 100644
+--- a/vllm_neuron/model/registry.py
++++ b/vllm_neuron/model/registry.py
+@@ -3,6 +3,7 @@ import os
+ 
+ from .llama3 import LlamaForCausalLM
+ from .gpt_oss import GptOssForCausalLM
++from .llama_bidirec import LlamaBidirectionalModel
+ from .llama3 import Eagle3LlamaForCausalLM
+ from .qwen3 import Qwen3ForCausalLM
+ from .qwen3_vl import Qwen3VLForConditionalGeneration
+@@ -21,6 +22,7 @@ def get_models() -> list[tuple[str, type]]:
+         ("LlamaForCausalLM", LlamaForCausalLM),
+         ("GptOssForCausalLM", GptOssForCausalLM),
+         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
++        ("LlamaBidirectionalModel", LlamaBidirectionalModel),
+         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
+         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+     ]

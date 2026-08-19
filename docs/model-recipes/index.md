@@ -33,6 +33,13 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy Llama-Embed-Nemotron 8B
+:link: llama-embed-nemotron-8b
+:link-type: doc
+
+Model recipe for nvidia/llama-embed-nemotron-8b (bidirectional Llama pooling / embeddings) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Llama 3 <llama-3>
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
 Qwen3-Embedding <qwen3-embedding-8b>
+Llama-Embed-Nemotron <llama-embed-nemotron-8b>
 :::
