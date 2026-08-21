@@ -57,7 +57,7 @@ to build and serve the model.
 
 | Model | Type | Instance | vLLM-Neuron Plugin | Neuron SDK | Branch |
 |---|---|---|---|---|---|
-| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-devstral-ministral3`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
+| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-devstral-ministral3`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
 | [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-llama-embed-nemotron`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
 | [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-moe`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
@@ -67,9 +67,10 @@ to build and serve the model.
 > **Note:** These are contributed ports on feature branches, validated for
 > correctness by their contributors. They are not part of the officially supported
 > model set listed above. Each branch targets the plugin / Neuron SDK version in
-> its row — `add-llama-embed-nemotron` is hosted on **0.24.0.1.1.0 / Neuron 2.32**
-> (this base); the remaining branches are still on 0.21.0.1.0.0 / Neuron 2.31 and
-> are re-hosted onto 0.24 individually.
+> its row — `add-llama-embed-nemotron` and `add-devstral-ministral3` are hosted on
+> **0.24.0.1.1.0 / Neuron 2.32** (this base); the remaining branches are still on
+> 0.21.0.1.0.0 / Neuron 2.31 and are re-hosted onto 0.24 individually. A branch's
+> pre-0.24 state is kept alongside it with a `-231` suffix.
 
 ## Features
 
