@@ -204,8 +204,46 @@ def register():
     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
 
     _patch_dcp_config_validation()
+    _register_ministral3_hf_config()
 
     return get_platform_class()
+
+
+# Module-level handle for the Ministral3 HF config class (bound lazily inside
+# _register_ministral3_hf_config). Kept at module scope so instances are
+# picklable across engine-core subprocesses under data_parallel_size>1.
+_Ministral3HFConfig = None
+
+
+def _register_ministral3_hf_config() -> None:
+    """Register the Ministral3 model_type with HuggingFace AutoConfig.
+
+    Ministral3 (e.g. Devstral-2-123B-Instruct-2512) targets transformers 5.x and
+    is not in the installed transformers' CONFIG_MAPPING, so vLLM's
+    AutoConfig.from_pretrained() would raise KeyError('ministral3'). We register a
+    minimal PretrainedConfig subclass that simply absorbs all fields from the HF
+    config dict (the Neuron model reads them via Ministral3Config.from_configs).
+    """
+    from transformers import AutoConfig, PretrainedConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    global _Ministral3HFConfig
+    if _Ministral3HFConfig is None:
+        class _Ministral3HFConfig(PretrainedConfig):  # noqa: F811
+            model_type = "ministral3"
+
+        # Make the class picklable: with data_parallel_size>1 vLLM spawns
+        # engine-core subprocesses and pickles the HF config across the process
+        # boundary. A function-local class has qualname
+        # "_register_ministral3_hf_config.<locals>._Ministral3HFConfig", which
+        # pickle cannot resolve. Bind it to a module-level name so pickle finds
+        # it as vllm_neuron._Ministral3HFConfig (TP-only never crosses the
+        # boundary, which is why this only surfaces under DP).
+        _Ministral3HFConfig.__qualname__ = "_Ministral3HFConfig"
+        _Ministral3HFConfig.__module__ = __name__
+
+    if "ministral3" not in CONFIG_MAPPING:
+        AutoConfig.register("ministral3", _Ministral3HFConfig)
 
 
 def __getattr__(name):

@@ -78,6 +78,7 @@ from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
     get_decode_padded_batch_size,
+    pick_kv_segment_size,
 )
 from vllm_neuron.utils.spec_decode_utils import (
     extract_next_token_ids,
@@ -620,7 +621,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     explicit_num_batched_tokens_buckets,
                 )
             )
-            kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+            # Buffers and the scheduler's Q padding must accommodate the LARGEST
+            # compiled segment, not buckets[0]: with several sizes any of them may
+            # be selected at runtime.
+            kv_segment_size = max(self.neuron_config.kv_segment_size_buckets)
 
             # Auto-set num_batched_tokens_buckets to match if not explicitly set
             if not user_set_num_batched_tokens_buckets:
@@ -635,7 +639,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             if self.max_num_batched_tokens < kv_segment_size:
                 logger.warning(
-                    "max_num_batched_tokens (%s) < segment size (%s). Adjusting to %s.",
+                    "max_num_batched_tokens (%s) < largest segment size (%s). "
+                    "Adjusting to %s.",
                     self.max_num_batched_tokens,
                     kv_segment_size,
                     kv_segment_size,
@@ -4161,7 +4166,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # use in attention_metadata. Now we only use the ones below.
             kv_segment_size = 0
             if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+                # With several compiled segment sizes, choose per step from the
+                # prior length; with one, this returns that one (unchanged
+                # behaviour). max_query_len clamps upwards because the kernel
+                # requires seqlen_q <= kv_segment_size.
+                kv_segment_size = pick_kv_segment_size(
+                    cached_seq_len,
+                    self.neuron_config.kv_segment_size_buckets,
+                    active_seq_len=max_query_len,
+                )
 
             swa_kv_pos_offset = None
 
@@ -4265,6 +4278,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode_token_threshold: int | None = None,
         ctx_bucket: int | None = None,
         device: torch.device | None = None,
+        kv_segment_size: int | None = None,
     ) -> dict:
         """
         Build attention metadata for warmup without using InputBatch.
@@ -4285,6 +4299,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for non-SWA groups; SWA groups always trim to the window.
             device: Device to allocate synthetic tensors on. Defaults to
                 ``self.device``.
+            kv_segment_size: Compile this exact segment size instead of letting
+                ``pick_kv_segment_size`` choose. Warmup must be able to request a
+                specific size, because with several compiled sizes each
+                ``(bucket, segment)`` pair is its own NEFF and every pair has to
+                be built. ``None`` keeps the runtime selection behaviour.
 
         Returns:
             dict mapping layer names to attention metadata dicts
@@ -4409,9 +4428,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # max_query_len: for prefill = bucket_size, for decode = 1
             max_query_len = num_tokens // num_reqs
 
-            kv_segment_size = 0
-            if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+            if kv_segment_size is not None:
+                # Warmup asked for a specific size: compile exactly that NEFF.
+                seg_size = kv_segment_size
+            elif self.neuron_config.kv_segment_size_buckets is not None:
+                seg_size = pick_kv_segment_size(
+                    cached_seq_len,
+                    self.neuron_config.kv_segment_size_buckets,
+                    active_seq_len=max_query_len,
+                )
+            else:
+                seg_size = 0
 
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
@@ -4423,7 +4450,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "cached_seq_len": torch.tensor(
                     [[cached_seq_len]], dtype=torch.int32, device=device
                 ),
-                "kv_segment_size": kv_segment_size,
+                "kv_segment_size": seg_size,
                 "full_block_table_tensor": full_block_table_tensor,
             }
             if swa_kv_pos_offset is not None:
@@ -4481,6 +4508,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # (matches _build_attention_metadata where max_num_draft_tokens=0).
             decode_token_threshold=1,
             device=device,
+            # Compile the exact segment size this warmup iteration is for: with
+            # several compiled sizes each (bucket, segment) pair is its own NEFF.
+            kv_segment_size=kv_segment_size if kv_segment_size > 0 else None,
         )
 
         # Create dummy sampling params for warmup

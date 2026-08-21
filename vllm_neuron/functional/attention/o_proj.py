@@ -35,7 +35,13 @@ def _can_use_kernel(
     if active.dim() != 4:
         return False
 
-    B, N, D, S = active.shape
+    if quantization_type == QuantizationType.ROW:
+        # 🎯 ROW (2026-08-10 01:00 JST): the kernel takes [B, S, N, D] for ROW and
+        # [B, N, D, S] for every other path (output_projection_cte.py:116-124). Unpack in the
+        # matching order so the constraint checks below see the right dimensions.
+        B, S, N, D = active.shape
+    else:
+        B, N, D, S = active.shape
     ND_weight, H = weight.shape
 
     if quantization_type == QuantizationType.MX:
@@ -182,14 +188,27 @@ def o_proj(
         If active is 3D [B, S, N*D], it is reshaped to [B, N, D, S] for the
         NKI kernel using D inferred from weight shape.
     """
-    # Reshape 3D [B, S, N*D] to 4D [B, N, D, S] for kernel compatibility
+    # Reshape 3D [B, S, N*D] to the 4D layout the kernel expects.
+    # 🎯 ROW wants [B, S, N, D]; every other path wants [B, N, D, S]
+    # (output_projection_cte.py:116-124). Added 2026-08-10 01:00 JST for the dynamic-quant
+    # experiment on o_proj — see README §1.6c: a static per-tensor scale was measured to be a
+    # pure trade-off (recalibrating it improves 5 prompts and regresses 5), so per-token dynamic
+    # quantization is the option that can remove the calibration problem instead of moving it.
     if active.dim() == 3:
         B, S_len, ND = active.shape
         D = min(128, ND)  # head_dim is at most 128 (P_MAX)
         while ND % D != 0 and D > 1:
             D -= 1
         N = ND // D
-        active = active.transpose(1, 2).reshape(B, N, D, S_len)
+        if quantization_type == QuantizationType.ROW:
+            active = active.reshape(B, S_len, N, D)
+        else:
+            active = active.transpose(1, 2).reshape(B, N, D, S_len)
+    # 🔴 A 4-D input is taken AS GIVEN — no shape sniffing. For ROW the caller must hand over
+    # [B, S, N, D] itself (ministral3/model.py does this explicitly). Guessing the layout from
+    # the extents would silently transpose a legitimate tensor whenever S happened to look like
+    # a head count, and a wrong permute here produces plausible-looking garbage rather than an
+    # error — precisely the failure mode this investigation has spent a session chasing.
 
     if _can_use_kernel(active, weight, quantization_type):
         wrapped_output_projection = wrap_nki(output_projection)

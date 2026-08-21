@@ -810,16 +810,25 @@ def segmented_attention(
                 f"block_size ({block_size})."
             )
 
-    # 5. Query sequence length must equal kv_segment_size.
-    #    TODO: This is a temporary constraint. The kernel can be extended to
-    #    support seqlen_q != prior_seg_size (e.g., smaller Q attending to a
-    #    larger KV segment) once the active-segment tiling logic is decoupled
-    #    from the query length.
-    if seqlen_q != kv_segment_size:
+    # 5. Query sequence length constraints.
+    #    The kernel no longer requires seqlen_q == prior_seg_size: it derives the
+    #    active segment from seqlen_q and the prior segments from prior_seg_size
+    #    independently, then sizes SBUF as max() of the two. Its only asserts are
+    #    `seqlen_q % 128 == 0` and `seqlen_q % block_size == 0`, so mirror exactly
+    #    those here. Allowing seqlen_q < kv_segment_size is what lets an APC cache
+    #    hit run a short query against a long cached prior instead of re-running a
+    #    full-length prefill.
+    if seqlen_q % 128 == 0 and seqlen_q % block_size == 0:
+        pass
+    else:
         raise ValueError(
-            f"Query sequence length ({seqlen_q}) must equal "
-            f"kv_segment_size ({kv_segment_size}). The segmented kernel "
-            f"currently requires seqlen_q == kv_segment_size."
+            f"Query sequence length ({seqlen_q}) must be a multiple of 128 and "
+            f"of block_size ({block_size}); the segmented kernel asserts both."
+        )
+    if seqlen_q > kv_segment_size:
+        raise ValueError(
+            f"Query sequence length ({seqlen_q}) must not exceed kv_segment_size "
+            f"({kv_segment_size})."
         )
 
     # Compute default scale if not provided

@@ -1,0 +1,698 @@
+diff --git a/vllm_neuron/__init__.py b/vllm_neuron/__init__.py
+index c60d720..016b4b2 100644
+--- a/vllm_neuron/__init__.py
++++ b/vllm_neuron/__init__.py
+@@ -204,10 +204,48 @@ def register():
+     from vllm_neuron.vllm.platform import _patch_dcp_config_validation
+ 
+     _patch_dcp_config_validation()
++    _register_ministral3_hf_config()
+ 
+     return get_platform_class()
+ 
+ 
++# Module-level handle for the Ministral3 HF config class (bound lazily inside
++# _register_ministral3_hf_config). Kept at module scope so instances are
++# picklable across engine-core subprocesses under data_parallel_size>1.
++_Ministral3HFConfig = None
++
++
++def _register_ministral3_hf_config() -> None:
++    """Register the Ministral3 model_type with HuggingFace AutoConfig.
++
++    Ministral3 (e.g. Devstral-2-123B-Instruct-2512) targets transformers 5.x and
++    is not in the installed transformers' CONFIG_MAPPING, so vLLM's
++    AutoConfig.from_pretrained() would raise KeyError('ministral3'). We register a
++    minimal PretrainedConfig subclass that simply absorbs all fields from the HF
++    config dict (the Neuron model reads them via Ministral3Config.from_configs).
++    """
++    from transformers import AutoConfig, PretrainedConfig
++    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
++
++    global _Ministral3HFConfig
++    if _Ministral3HFConfig is None:
++        class _Ministral3HFConfig(PretrainedConfig):  # noqa: F811
++            model_type = "ministral3"
++
++        # Make the class picklable: with data_parallel_size>1 vLLM spawns
++        # engine-core subprocesses and pickles the HF config across the process
++        # boundary. A function-local class has qualname
++        # "_register_ministral3_hf_config.<locals>._Ministral3HFConfig", which
++        # pickle cannot resolve. Bind it to a module-level name so pickle finds
++        # it as vllm_neuron._Ministral3HFConfig (TP-only never crosses the
++        # boundary, which is why this only surfaces under DP).
++        _Ministral3HFConfig.__qualname__ = "_Ministral3HFConfig"
++        _Ministral3HFConfig.__module__ = __name__
++
++    if "ministral3" not in CONFIG_MAPPING:
++        AutoConfig.register("ministral3", _Ministral3HFConfig)
++
++
+ def __getattr__(name):
+     import importlib
+ 
+diff --git a/vllm_neuron/functional/attention/attention_segmented_cte.py b/vllm_neuron/functional/attention/attention_segmented_cte.py
+index adfbc4c..da15c53 100644
+--- a/vllm_neuron/functional/attention/attention_segmented_cte.py
++++ b/vllm_neuron/functional/attention/attention_segmented_cte.py
+@@ -810,16 +810,25 @@ def segmented_attention(
+                 f"block_size ({block_size})."
+             )
+ 
+-    # 5. Query sequence length must equal kv_segment_size.
+-    #    TODO: This is a temporary constraint. The kernel can be extended to
+-    #    support seqlen_q != prior_seg_size (e.g., smaller Q attending to a
+-    #    larger KV segment) once the active-segment tiling logic is decoupled
+-    #    from the query length.
+-    if seqlen_q != kv_segment_size:
++    # 5. Query sequence length constraints.
++    #    The kernel no longer requires seqlen_q == prior_seg_size: it derives the
++    #    active segment from seqlen_q and the prior segments from prior_seg_size
++    #    independently, then sizes SBUF as max() of the two. Its only asserts are
++    #    `seqlen_q % 128 == 0` and `seqlen_q % block_size == 0`, so mirror exactly
++    #    those here. Allowing seqlen_q < kv_segment_size is what lets an APC cache
++    #    hit run a short query against a long cached prior instead of re-running a
++    #    full-length prefill.
++    if seqlen_q % 128 == 0 and seqlen_q % block_size == 0:
++        pass
++    else:
++        raise ValueError(
++            f"Query sequence length ({seqlen_q}) must be a multiple of 128 and "
++            f"of block_size ({block_size}); the segmented kernel asserts both."
++        )
++    if seqlen_q > kv_segment_size:
+         raise ValueError(
+-            f"Query sequence length ({seqlen_q}) must equal "
+-            f"kv_segment_size ({kv_segment_size}). The segmented kernel "
+-            f"currently requires seqlen_q == kv_segment_size."
++            f"Query sequence length ({seqlen_q}) must not exceed kv_segment_size "
++            f"({kv_segment_size})."
+         )
+ 
+     # Compute default scale if not provided
+diff --git a/vllm_neuron/functional/attention/o_proj.py b/vllm_neuron/functional/attention/o_proj.py
+index 61e7a16..869d566 100644
+--- a/vllm_neuron/functional/attention/o_proj.py
++++ b/vllm_neuron/functional/attention/o_proj.py
+@@ -35,7 +35,13 @@ def _can_use_kernel(
+     if active.dim() != 4:
+         return False
+ 
+-    B, N, D, S = active.shape
++    if quantization_type == QuantizationType.ROW:
++        # 🎯 ROW (2026-08-10 01:00 JST): the kernel takes [B, S, N, D] for ROW and
++        # [B, N, D, S] for every other path (output_projection_cte.py:116-124). Unpack in the
++        # matching order so the constraint checks below see the right dimensions.
++        B, S, N, D = active.shape
++    else:
++        B, N, D, S = active.shape
+     ND_weight, H = weight.shape
+ 
+     if quantization_type == QuantizationType.MX:
+@@ -182,14 +188,27 @@ def o_proj(
+         If active is 3D [B, S, N*D], it is reshaped to [B, N, D, S] for the
+         NKI kernel using D inferred from weight shape.
+     """
+-    # Reshape 3D [B, S, N*D] to 4D [B, N, D, S] for kernel compatibility
++    # Reshape 3D [B, S, N*D] to the 4D layout the kernel expects.
++    # 🎯 ROW wants [B, S, N, D]; every other path wants [B, N, D, S]
++    # (output_projection_cte.py:116-124). Added 2026-08-10 01:00 JST for the dynamic-quant
++    # experiment on o_proj — see README §1.6c: a static per-tensor scale was measured to be a
++    # pure trade-off (recalibrating it improves 5 prompts and regresses 5), so per-token dynamic
++    # quantization is the option that can remove the calibration problem instead of moving it.
+     if active.dim() == 3:
+         B, S_len, ND = active.shape
+         D = min(128, ND)  # head_dim is at most 128 (P_MAX)
+         while ND % D != 0 and D > 1:
+             D -= 1
+         N = ND // D
+-        active = active.transpose(1, 2).reshape(B, N, D, S_len)
++        if quantization_type == QuantizationType.ROW:
++            active = active.reshape(B, S_len, N, D)
++        else:
++            active = active.transpose(1, 2).reshape(B, N, D, S_len)
++    # 🔴 A 4-D input is taken AS GIVEN — no shape sniffing. For ROW the caller must hand over
++    # [B, S, N, D] itself (ministral3/model.py does this explicitly). Guessing the layout from
++    # the extents would silently transpose a legitimate tensor whenever S happened to look like
++    # a head count, and a wrong permute here produces plausible-looking garbage rather than an
++    # error — precisely the failure mode this investigation has spent a session chasing.
+ 
+     if _can_use_kernel(active, weight, quantization_type):
+         wrapped_output_projection = wrap_nki(output_projection)
+diff --git a/vllm_neuron/functional/mlp.py b/vllm_neuron/functional/mlp.py
+index b5dbc0b..2d061ac 100644
+--- a/vllm_neuron/functional/mlp.py
++++ b/vllm_neuron/functional/mlp.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ import math
++import os
+ 
+ import torch
+ from torch import Tensor
+@@ -7,6 +8,7 @@ from torch import Tensor
+ from nkilib.core.mlp.mlp import mlp as nkilib_mlp
+ from nkilib.core.utils.common_types import (
+     ActFnType,
++    ComputationMode,
+     DtypeMode,
+     NormType,
+     QuantizationType,
+@@ -57,6 +59,28 @@ _MX_PACKED_SCALE_BYTES = 4
+ # tiles of 128 partitions x 4 x4-packed fp8 bytes. The per-model MX weight loaders
+ # (e.g. qwen3_vl) import these so the packed nn.Parameter shapes and the loader
+ # swizzle share one definition.
++# ── EXPERIMENT ONLY (2026-08-08): force the MLP kernel choice ────────────────────────────────
++# nkilib picks TKG vs CTE on `batch_size * sequence_len <= TKG_BS_SEQLEN_THRESHOLD` (96,
++# mlp_parameters.py::is_mlp_tkg). For a 1-token decode step that means num_seqs vs 96, so a
++# num_seqs sweep across 96 changes the KERNEL as well as the amount of padding, and a throughput
++# delta cannot be attributed to either alone. This knob forces one side so the 2x2 can be measured:
++#
++#   FORCE_MLP_KERNEL=cte   -> force_cte_mode=True        (CTE even at small batch)
++#   FORCE_MLP_KERNEL=tkg   -> mode=ComputationMode.DECODE (TKG even at large batch; it is
++#                             is_mlp_tkg's first clause and bypasses the threshold entirely)
++#   unset / auto           -> stock behaviour, byte-identical to every recorded measurement
++#
++# 🔴 MUST be kept consistent with ministral3/model.py's `_runs_on_cte`, which recomputes the SAME
++# threshold to decide whether to fp8-pre-quantize the hidden. Forcing only this side desynchronises
++# them and reproduces the 2.32 port bug: a bf16 hidden reaching the kernel's fp8 source transpose
++# ("nc_matmul (transpose mode) dst dtype must match input dtype ... got dst=float8_e4m3 but
++# input=bfloat16"). model.py reads the same env var for exactly that reason.
++_FORCE_MLP_KERNEL = (os.environ.get("FORCE_MLP_KERNEL") or "auto").strip().lower()
++if _FORCE_MLP_KERNEL not in ("auto", "tkg", "cte"):
++    raise ValueError(
++        f"FORCE_MLP_KERNEL must be auto|tkg|cte, got {_FORCE_MLP_KERNEL!r}"
++    )
++
+ _PMAX = 128  # partition dim (nl.tile_size.pmax)
+ _Q_WIDTH = 4  # 4 float8_e4m3fn bytes per nl.float8_e4m3fn_x4 / uint32 element
+ _TILE_SIZE = _PMAX * _Q_WIDTH  # 512 -- the 512-element H/I tile of the MX layout
+@@ -205,7 +229,13 @@ def mlp(
+             gate_clamp_lower_limit=gate_clamp_lower_limit,
+             up_clamp_upper_limit=up_clamp_upper_limit,
+             up_clamp_lower_limit=up_clamp_lower_limit,
+-            force_cte_mode=False,
++            # EXPERIMENT: see _FORCE_MLP_KERNEL above. Default path is unchanged (False/AUTO).
++            force_cte_mode=(_FORCE_MLP_KERNEL == "cte"),
++            mode=(
++                ComputationMode.DECODE
++                if _FORCE_MLP_KERNEL == "tkg"
++                else ComputationMode.AUTO
++            ),
+             dtype_mode=DtypeMode.AUTO,
+             **(
+                 {"gate_up_w_layout": gate_up_w_layout}
+@@ -309,6 +339,28 @@ def _can_use_kernel(
+         H_eff = H - _MX_PACKED_SCALE_BYTES if H % 128 == _MX_PACKED_SCALE_BYTES else H
+         return H_eff % 128 == 0
+ 
++    # 🔴 2026-08-18: ROW shares MX's packed-activation layout, and this check used to reject it.
++    # For CTE + QuantizationType.ROW the kernel wants a PRE-QUANTIZED fp8 hidden carrying the
++    # per-row fp32 scale bit-cast into a trailing 4 bytes -- `[T, H+4]`
++    # (nkilib mlpp_input_has_packed_scale; the CTE loader splits it in
++    # mlp_cte/basic/mlp_cte_basic_tensor_io.py::load_packed_hidden_scales). Only the MX arm above
++    # stripped that tail, so a ROW-packed hidden failed `H % 128 != 0`, this function returned
++    # False, and the wrapper fell back to the PyTorch reference path -- which then died on
++    # `aten.mm` with `[128, 12292] X [12288, 896]` during FX tracing. The kernel was never the
++    # problem; the eligibility gate was.
++    # The `H % 128 == 4` guard is the same safety argument as MX's: a real unpacked hidden always
++    # has H % 128 == 0, so this arm cannot silently eat 4 genuine elements.
++    # ⚠️ Compare enum members directly — do NOT call ``quantization_type.is_logical_row()``.
++    # Dynamo cannot trace a bound method on a sourceless enum constant and dies with
++    # "SourcelessBuilder.create does not know how to wrap <class 'method'>" (gb0116), which
++    # surfaces only as a parallel-trace lane failure during compile (measured 2026-08-18).
++    # Every other branch in this function uses ``==`` for the same reason.
++    if (
++        quantization_type == QuantizationType.ROW
++        or quantization_type == QuantizationType.ROW_MX
++    ) and H % 128 == _MX_PACKED_SCALE_BYTES:
++        H = H - _MX_PACKED_SCALE_BYTES
++
+     if H % 128 != 0:
+         return False
+ 
+diff --git a/vllm_neuron/model/__init__.py b/vllm_neuron/model/__init__.py
+index 46ec736..70d7b5f 100644
+--- a/vllm_neuron/model/__init__.py
++++ b/vllm_neuron/model/__init__.py
+@@ -3,6 +3,6 @@ import importlib as _importlib
+ 
+ 
+ def __getattr__(name):
+-    if name in ("llama3", "gpt_oss"):
++    if name in ("llama3", "gpt_oss", "ministral3"):
+         return _importlib.import_module(f".{name}", __name__)
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/vllm_neuron/model/registry.py b/vllm_neuron/model/registry.py
+index 8b90af3..42b157a 100644
+--- a/vllm_neuron/model/registry.py
++++ b/vllm_neuron/model/registry.py
+@@ -6,6 +6,7 @@ from .gpt_oss import GptOssForCausalLM
+ from .llama3 import Eagle3LlamaForCausalLM
+ from .qwen3 import Qwen3ForCausalLM
+ from .qwen3_vl import Qwen3VLForConditionalGeneration
++from .ministral3 import Ministral3ForCausalLM
+ 
+ 
+ def get_models() -> list[tuple[str, type]]:
+@@ -23,6 +24,7 @@ def get_models() -> list[tuple[str, type]]:
+         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
+         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
+         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
++        ("Ministral3ForCausalLM", Ministral3ForCausalLM),
+     ]
+ 
+     # SyntheticNeuronModel is a testing-only model that replaces real neural
+diff --git a/vllm_neuron/utils/bucket_utils.py b/vllm_neuron/utils/bucket_utils.py
+index 1533aa0..3d99c87 100644
+--- a/vllm_neuron/utils/bucket_utils.py
++++ b/vllm_neuron/utils/bucket_utils.py
+@@ -397,13 +397,15 @@ def validate_kv_segment_size_buckets(
+         2. Buckets must be in strictly ascending order.
+         3. Each value must be one of the sizes supported by the segmented
+            attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``).
++        4. Every prefill bucket must be a legal query length that fits the
++           largest segment size (multiple of 128, and <= max(buckets)).
+ 
+-    Current kernel limitations (will be relaxed in the future):
+-        4. Only one segment size is supported (len == 1).
+-        5. When num_batched_tokens_buckets is explicitly set by the user, it
+-           must equal kv_segment_size_buckets because the segmented kernel
+-           currently requires the prefill bucket length to be exactly the
+-           segment size.
++    Multiple segment sizes are supported: warmup compiles the cross product
++    ``kv_segment_size x num_batched_tokens_buckets`` and the NEFF cache keys the
++    two dimensions independently, so the only requirement is that each prefill
++    bucket is legal against the *largest* compiled segment. The per-request
++    choice among the compiled segment sizes is made at runtime by
++    :func:`pick_kv_segment_size`.
+ 
+     Args:
+         buckets: List of segment size buckets to validate.
+@@ -421,6 +423,8 @@ def validate_kv_segment_size_buckets(
+         [2048]
+         >>> validate_kv_segment_size_buckets([2048], [2048])
+         [2048]
++        >>> validate_kv_segment_size_buckets([512, 2048], [128, 512])
++        [512, 2048]
+     """
+     param_name = "kv_segment_size_buckets"
+ 
+@@ -451,33 +455,109 @@ def validate_kv_segment_size_buckets(
+                 f"Please use one of these values."
+             )
+ 
+-    # --- Current kernel limitations ---
+-
+-    # 4. Only one segment size for now
+-    if len(buckets) != 1:
+-        # TODO: Add support for multiple segment sizes and implement
+-        # bucket selection logic.
+-        raise ValueError(
+-            f"Only one segment size is currently supported, got "
+-            f"{len(buckets)}: {buckets}."
+-        )
+-
+-    # 5. If user explicitly set num_batched_tokens_buckets, it must match
++    # 4. Prefill buckets must be legal query lengths that fit the largest
++    #    segment size.
++    #    Previously this required an exact match against a single segment size, on
++    #    the premise that "the segmented kernel requires the prefill bucket length
++    #    to equal the segment size". That premise does not hold: the kernel derives
++    #    the active segment from seqlen_q and the prior segments from
++    #    prior_seg_size independently, then sizes SBUF as max() of the two. So the
++    #    only requirement is that each prefill bucket is a legal query length
++    #    (multiple of 128) that fits the segment it will run against.
++    #
++    #    Bound against max(buckets), not buckets[0]: with several compiled segment
++    #    sizes a bucket only has to fit the segment actually selected for it at
++    #    runtime, and pick_kv_segment_size() never returns a segment smaller than
++    #    the active query length (see its clamping contract). Bounding on the
++    #    smallest segment would reject legal ladders such as
++    #    nb=[128,512] x ks=[512,2048].
++    #
++    #    Warmup already compiles the cross product kv_seg x bucket and the NEFF
++    #    cache keys them separately, so multiple segment sizes need no further
++    #    plumbing here.
+     if num_batched_tokens_buckets is not None:
+-        # TODO: Remove this constraint once prefill bucket length is
+-        # decoupled from prior segment size in the segmented kernel.
+-        if num_batched_tokens_buckets != buckets:
++        seg_max = max(buckets)
++        bad = [b for b in num_batched_tokens_buckets if b > seg_max]
++        if bad:
++            raise ValueError(
++                f"num_batched_tokens_buckets entries must not exceed the largest "
++                f"{param_name}={seg_max}; got {bad}."
++            )
++        illegal = [b for b in num_batched_tokens_buckets if b % 128 != 0]
++        if illegal:
+             raise ValueError(
+-                f"When {param_name} is set, num_batched_tokens_buckets must "
+-                f"match because the segmented kernel currently requires the "
+-                f"prefill bucket length to equal the segment size. "
+-                f"Got num_batched_tokens_buckets={num_batched_tokens_buckets}, "
+-                f"{param_name}={buckets}"
++                f"num_batched_tokens_buckets entries must be multiples of 128 "
++                f"(the segmented kernel asserts seqlen_q % 128 == 0); "
++                f"got {illegal}."
+             )
+ 
+     return buckets
+ 
+ 
++def pick_kv_segment_size(
++    cached_seq_len: int,
++    kv_segment_size_buckets: list[int],
++    active_seq_len: int = 0,
++) -> int:
++    """Pick the kv_segment_size to use for one prefill step.
++
++    Chooses the compiled segment size that minimizes kernel launches over the
++    prior (already-cached) KV, preferring fewer iterations, then less wasted
++    tail, then larger segments:
++
++        num_segments = ceil(cached_seq_len / kv_segment_size)
++        tail_waste   = num_segments * kv_segment_size - cached_seq_len
++        score        = (num_segments, tail_waste, -kv_segment_size)
++
++    and returns the lexicographically smallest. With a single compiled size the
++    result is always that size, so behaviour is unchanged from the pre-``#5``
++    single-segment configuration.
++
++    ``active_seq_len`` clamps the result upwards: the segmented kernel requires
++    ``seqlen_q <= kv_segment_size`` (see ``attention_segmented_cte``), so a
++    segment smaller than the active query length is never legal even when it
++    scores better on the prior. The smallest compiled size that still admits the
++    query wins; if none does, the largest compiled size is returned and the
++    kernel wrapper's own validation reports the violation.
++
++    Args:
++        cached_seq_len: Number of prior (already-cached) KV tokens.
++        kv_segment_size_buckets: Compiled KV segment sizes (ascending).
++        active_seq_len: Active query length for this step (0 = unconstrained).
++
++    Returns:
++        The selected kv_segment_size.
++
++    Example:
++        >>> pick_kv_segment_size(0, [512, 2048])
++        512
++        >>> pick_kv_segment_size(4096, [512, 2048])
++        2048
++        >>> pick_kv_segment_size(0, [512, 2048], active_seq_len=1024)
++        2048
++    """
++    if not kv_segment_size_buckets:
++        raise ValueError("kv_segment_size_buckets cannot be empty")
++
++    # Only segments that can legally hold the active query are candidates.
++    legal = [s for s in kv_segment_size_buckets if s >= active_seq_len]
++    if not legal:
++        # Let the kernel wrapper raise with its own precise message.
++        return max(kv_segment_size_buckets)
++
++    if cached_seq_len <= 0:
++        # No prior to iterate over, so launch overhead dominates: take the
++        # smallest legal segment.
++        return min(legal)
++
++    def _score(kv_segment_size: int) -> tuple[int, int, int]:
++        num_segments = (cached_seq_len + kv_segment_size - 1) // kv_segment_size
++        tail_waste = num_segments * kv_segment_size - cached_seq_len
++        return num_segments, tail_waste, -kv_segment_size
++
++    return min(legal, key=_score)
++
++
+ # NKI attention kernel tile constraint. Same constant as
+ # `_compute_swa_num_blocks` rounds to. The block-table seq dim must be a
+ # multiple of P_MAX // block_size.
+diff --git a/vllm_neuron/vllm/platform.py b/vllm_neuron/vllm/platform.py
+index cf9038c..f32607f 100644
+--- a/vllm_neuron/vllm/platform.py
++++ b/vllm_neuron/vllm/platform.py
+@@ -162,14 +162,59 @@ class NeuronPlatform(Platform):
+         """Register Neuron model architectures before ModelConfig validation."""
+         import os
+ 
+-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+-            from vllm.model_executor.models.registry import ModelRegistry
++        from vllm.model_executor.models.registry import ModelRegistry
+ 
++        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
+             ModelRegistry.register_model(
+                 "SyntheticNeuronModel",
+                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
+             )
+ 
++        # Pre-register Ministral3 with a pre-built _ModelInfo so
++        # is_text_generation_model=True is set without a subprocess inspection
++        # (which would fail on vllm.config circular imports at plugin load time).
++        # The neuron_worker later re-registers the real impl class (same pattern
++        # as GptOssForCausalLM).
++        from vllm.model_executor.models.registry import (
++            _ModelInfo,
++            _RegisteredModel,
++        )
++
++        _common_info = dict(
++            is_text_generation_model=True,
++            is_pooling_model=False,
++            attn_type="decoder",
++            default_seq_pooling_type="LAST",
++            default_tok_pooling_type="ALL",
++            score_type="bi-encoder",
++            supports_multimodal=False,
++            supports_multimodal_raw_input_only=False,
++            requires_raw_input_tokens=False,
++            supports_multimodal_encoder_tp_data=False,
++            supports_pp=False,
++            has_inner_state=False,
++            is_attention_free=False,
++            is_hybrid=False,
++            has_noops=False,
++            supports_mamba_prefix_caching=False,
++            supports_transcription=False,
++            supports_transcription_only=False,
++        )
++        _ministral3_model_info = _ModelInfo(
++            architecture="Ministral3ForCausalLM", **_common_info
++        )
++
++        import torch.nn as nn
++
++        class _Ministral3Placeholder(nn.Module):
++            pass
++
++        if "Ministral3ForCausalLM" not in ModelRegistry.models:
++            ModelRegistry.models["Ministral3ForCausalLM"] = _RegisteredModel(
++                interfaces=_ministral3_model_info,
++                model_cls=_Ministral3Placeholder,
++            )
++
+     @classmethod
+     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+         """Default block_size to 32 for Neuron when the user didn't override."""
+diff --git a/vllm_neuron/vllm/worker/neuron_model_runner.py b/vllm_neuron/vllm/worker/neuron_model_runner.py
+index 38d8a1d..215267f 100644
+--- a/vllm_neuron/vllm/worker/neuron_model_runner.py
++++ b/vllm_neuron/vllm/worker/neuron_model_runner.py
+@@ -78,6 +78,7 @@ from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
+ from vllm_neuron.utils.bucket_utils import (
+     get_max_num_batched_tokens,
+     get_decode_padded_batch_size,
++    pick_kv_segment_size,
+ )
+ from vllm_neuron.utils.spec_decode_utils import (
+     extract_next_token_ids,
+@@ -620,7 +621,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                     explicit_num_batched_tokens_buckets,
+                 )
+             )
+-            kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
++            # Buffers and the scheduler's Q padding must accommodate the LARGEST
++            # compiled segment, not buckets[0]: with several sizes any of them may
++            # be selected at runtime.
++            kv_segment_size = max(self.neuron_config.kv_segment_size_buckets)
+ 
+             # Auto-set num_batched_tokens_buckets to match if not explicitly set
+             if not user_set_num_batched_tokens_buckets:
+@@ -635,7 +639,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+ 
+             if self.max_num_batched_tokens < kv_segment_size:
+                 logger.warning(
+-                    "max_num_batched_tokens (%s) < segment size (%s). Adjusting to %s.",
++                    "max_num_batched_tokens (%s) < largest segment size (%s). "
++                    "Adjusting to %s.",
+                     self.max_num_batched_tokens,
+                     kv_segment_size,
+                     kv_segment_size,
+@@ -4161,7 +4166,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             # use in attention_metadata. Now we only use the ones below.
+             kv_segment_size = 0
+             if self.neuron_config.kv_segment_size_buckets is not None:
+-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
++                # With several compiled segment sizes, choose per step from the
++                # prior length; with one, this returns that one (unchanged
++                # behaviour). max_query_len clamps upwards because the kernel
++                # requires seqlen_q <= kv_segment_size.
++                kv_segment_size = pick_kv_segment_size(
++                    cached_seq_len,
++                    self.neuron_config.kv_segment_size_buckets,
++                    active_seq_len=max_query_len,
++                )
+ 
+             swa_kv_pos_offset = None
+ 
+@@ -4265,6 +4278,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+         decode_token_threshold: int | None = None,
+         ctx_bucket: int | None = None,
+         device: torch.device | None = None,
++        kv_segment_size: int | None = None,
+     ) -> dict:
+         """
+         Build attention metadata for warmup without using InputBatch.
+@@ -4285,6 +4299,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 for non-SWA groups; SWA groups always trim to the window.
+             device: Device to allocate synthetic tensors on. Defaults to
+                 ``self.device``.
++            kv_segment_size: Compile this exact segment size instead of letting
++                ``pick_kv_segment_size`` choose. Warmup must be able to request a
++                specific size, because with several compiled sizes each
++                ``(bucket, segment)`` pair is its own NEFF and every pair has to
++                be built. ``None`` keeps the runtime selection behaviour.
+ 
+         Returns:
+             dict mapping layer names to attention metadata dicts
+@@ -4409,9 +4428,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             # max_query_len: for prefill = bucket_size, for decode = 1
+             max_query_len = num_tokens // num_reqs
+ 
+-            kv_segment_size = 0
+-            if self.neuron_config.kv_segment_size_buckets is not None:
+-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
++            if kv_segment_size is not None:
++                # Warmup asked for a specific size: compile exactly that NEFF.
++                seg_size = kv_segment_size
++            elif self.neuron_config.kv_segment_size_buckets is not None:
++                seg_size = pick_kv_segment_size(
++                    cached_seq_len,
++                    self.neuron_config.kv_segment_size_buckets,
++                    active_seq_len=max_query_len,
++                )
++            else:
++                seg_size = 0
+ 
+             attn_metadata_i = {
+                 "block_table_tensor": block_table_tensor,
+@@ -4423,7 +4450,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+                 "cached_seq_len": torch.tensor(
+                     [[cached_seq_len]], dtype=torch.int32, device=device
+                 ),
+-                "kv_segment_size": kv_segment_size,
++                "kv_segment_size": seg_size,
+                 "full_block_table_tensor": full_block_table_tensor,
+             }
+             if swa_kv_pos_offset is not None:
+@@ -4481,6 +4508,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
+             # (matches _build_attention_metadata where max_num_draft_tokens=0).
+             decode_token_threshold=1,
+             device=device,
++            # Compile the exact segment size this warmup iteration is for: with
++            # several compiled sizes each (bucket, segment) pair is its own NEFF.
++            kv_segment_size=kv_segment_size if kv_segment_size > 0 else None,
+         )
+ 
+         # Create dummy sampling params for warmup
+diff --git a/vllm_neuron/vllm/worker/neuron_worker.py b/vllm_neuron/vllm/worker/neuron_worker.py
+index 67a7cd3..b3e65ca 100644
+--- a/vllm_neuron/vllm/worker/neuron_worker.py
++++ b/vllm_neuron/vllm/worker/neuron_worker.py
+@@ -1493,16 +1493,45 @@ class NeuronWorker(WorkerBase):
+     def _prefill_compile_targets(self) -> list[tuple[int, int]]:
+         """Enumerate (num_batched_tokens, kv_segment_size) pairs to compile.
+ 
+-        Cartesian product of the configured prefill buckets and KV
+-        segment buckets. Mirror of ``_decode_compile_targets`` — both
+-        return the flat tuple list the trace pool consumes.
++        Cartesian product of the configured prefill buckets and KV segment buckets,
++        **minus the pairs that are unreachable at runtime**. Mirror of
++        ``_decode_compile_targets`` — both return the flat tuple list the trace pool
++        consumes.
++
++        🔴 Why pairs are filtered. The segmented attention kernel asserts
++        ``seqlen_q <= kv_segment_size``, and ``pick_kv_segment_size()`` clamps upwards so it
++        never selects a segment smaller than the active query length. A pair with
++        ``bucket_size > kv_seg_size`` therefore cannot occur in service — but tracing it raises
++        ``ValueError: Query sequence length (N) must not exceed kv_segment_size (M)``, which
++        aborts a parallel-trace lane and kills engine-core startup.
++
++        This is the compile-side counterpart of the runtime relaxation already carried in this
++        patch (a prefill bucket is bounded against ``max(kv_segment_size_buckets)``, not
++        ``buckets[0]``, because it only has to fit the segment selected for it at runtime).
++        Without this filter the effective constraint collapses back to ``max(nb) <= min(ks)``,
++        which forbids e.g. ``nb=[128,256,512,1024]`` with ``ks=[512,1024]`` even though every
++        reachable pair is legal. Measured 2026-08-20: that configuration died at startup.
+         """
+         num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
+-        return [
++        targets = [
+             (bucket_size, kv_seg_size)
+             for kv_seg_size in effective_kv_buckets
+             for bucket_size in num_batched_tokens_buckets
++            # kv_seg_size == 0 is the non-segmented sentinel — never filter it.
++            if kv_seg_size == 0 or bucket_size <= kv_seg_size
+         ]
++        dropped = (
++            len(effective_kv_buckets) * len(num_batched_tokens_buckets) - len(targets)
++        )
++        if dropped:
++            logger.info(
++                "Prefill compile targets: %s of %s pairs "
++                "(skipped %s unreachable bucket > kv_segment_size pair(s))",
++                len(targets),
++                len(effective_kv_buckets) * len(num_batched_tokens_buckets),
++                dropped,
++            )
++        return targets
+ 
+     def _extract_graphs(
+         self,
+@@ -1722,11 +1751,33 @@ class NeuronWorker(WorkerBase):
+             num_batched_tokens_buckets,
+         )
+ 
+-        total_warmups = len(effective_kv_buckets) * len(num_batched_tokens_buckets)
++        # 🔴 Skip (bucket, segment) pairs that are UNREACHABLE AT RUNTIME.
++        # The segmented attention kernel asserts `seqlen_q <= kv_segment_size`, and
++        # `pick_kv_segment_size()` clamps upwards so it never selects a segment smaller than the
++        # active query length. A pair with `bucket_size > kv_seg_size` therefore cannot occur in
++        # service -- but warming it up raises
++        #   ValueError: Query sequence length (N) must not exceed kv_segment_size (M)
++        # which aborts a parallel-trace lane and kills engine-core startup.
++        #
++        # This is the warmup-side counterpart of the runtime relaxation already carried in this
++        # patch (prefill buckets are bounded against max(kv_segment_size_buckets), not buckets[0],
++        # because a bucket only has to fit the segment selected for it at runtime). Without this
++        # skip the effective constraint collapses back to `max(nb) <= min(ks)`, which forbids
++        # e.g. nb=[128,256,512,1024] with ks=[512,1024] even though every reachable pair is legal.
++        # Measured 2026-08-20: that configuration died at startup before this skip was added.
++        # 🔴 Same filter as ``_prefill_compile_targets`` — see the docstring there. A pair with
++        # bucket_size > kv_seg_size is unreachable at runtime and raises in the kernel wrapper.
++        warmup_pairs = [
++            (kv_seg_size, bucket_size)
++            for kv_seg_size in effective_kv_buckets
++            for bucket_size in num_batched_tokens_buckets
++            if kv_seg_size == 0 or bucket_size <= kv_seg_size
++        ]
++        total_warmups = len(warmup_pairs)
+         warmup_count = 0
+ 
+-        for kv_seg_size in effective_kv_buckets:
+-            for bucket_size in num_batched_tokens_buckets:
++        for kv_seg_size, bucket_size in warmup_pairs:
++            if True:  # keeps the original body indentation
+                 warmup_count += 1
+                 logger.info(
+                     "\n[%s/%s] Warming up for prefill: bucket_size=%s, "

@@ -68,6 +68,13 @@ Configure encoder-disaggregated (EPD) multimodal topologies.
 Serve embeddings via `/v1/embeddings` with a pooling model.
 :::
 
+:::{grid-item-card} Deploy Devstral-2-123B (Ministral3)
+:link: tutorial-devstral-2-123b
+:link-type: doc
+
+Serve mistralai/Devstral-2-123B-Instruct-2512 at TP=8 or TP=8xDP=8 (FP8-native, APC on) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -83,4 +90,5 @@ Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmark
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
 Disaggregated encoder (1E1PD and xEyPD) <tutorial-epd-1e-1pd-xeypd>
 Deploying Qwen3-Embedding-8B <tutorial-qwen3-embedding-8b>
+Deploying Devstral-2-123B (Ministral3) <tutorial-devstral-2-123b>
 :::

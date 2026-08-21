@@ -162,12 +162,57 @@ class NeuronPlatform(Platform):
         """Register Neuron model architectures before ModelConfig validation."""
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
+            )
+
+        # Pre-register Ministral3 with a pre-built _ModelInfo so
+        # is_text_generation_model=True is set without a subprocess inspection
+        # (which would fail on vllm.config circular imports at plugin load time).
+        # The neuron_worker later re-registers the real impl class (same pattern
+        # as GptOssForCausalLM).
+        from vllm.model_executor.models.registry import (
+            _ModelInfo,
+            _RegisteredModel,
+        )
+
+        _common_info = dict(
+            is_text_generation_model=True,
+            is_pooling_model=False,
+            attn_type="decoder",
+            default_seq_pooling_type="LAST",
+            default_tok_pooling_type="ALL",
+            score_type="bi-encoder",
+            supports_multimodal=False,
+            supports_multimodal_raw_input_only=False,
+            requires_raw_input_tokens=False,
+            supports_multimodal_encoder_tp_data=False,
+            supports_pp=False,
+            has_inner_state=False,
+            is_attention_free=False,
+            is_hybrid=False,
+            has_noops=False,
+            supports_mamba_prefix_caching=False,
+            supports_transcription=False,
+            supports_transcription_only=False,
+        )
+        _ministral3_model_info = _ModelInfo(
+            architecture="Ministral3ForCausalLM", **_common_info
+        )
+
+        import torch.nn as nn
+
+        class _Ministral3Placeholder(nn.Module):
+            pass
+
+        if "Ministral3ForCausalLM" not in ModelRegistry.models:
+            ModelRegistry.models["Ministral3ForCausalLM"] = _RegisteredModel(
+                interfaces=_ministral3_model_info,
+                model_cls=_Ministral3Placeholder,
             )
 
     @classmethod

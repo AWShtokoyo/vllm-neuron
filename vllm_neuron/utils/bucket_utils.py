@@ -397,13 +397,15 @@ def validate_kv_segment_size_buckets(
         2. Buckets must be in strictly ascending order.
         3. Each value must be one of the sizes supported by the segmented
            attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``).
+        4. Every prefill bucket must be a legal query length that fits the
+           largest segment size (multiple of 128, and <= max(buckets)).
 
-    Current kernel limitations (will be relaxed in the future):
-        4. Only one segment size is supported (len == 1).
-        5. When num_batched_tokens_buckets is explicitly set by the user, it
-           must equal kv_segment_size_buckets because the segmented kernel
-           currently requires the prefill bucket length to be exactly the
-           segment size.
+    Multiple segment sizes are supported: warmup compiles the cross product
+    ``kv_segment_size x num_batched_tokens_buckets`` and the NEFF cache keys the
+    two dimensions independently, so the only requirement is that each prefill
+    bucket is legal against the *largest* compiled segment. The per-request
+    choice among the compiled segment sizes is made at runtime by
+    :func:`pick_kv_segment_size`.
 
     Args:
         buckets: List of segment size buckets to validate.
@@ -421,6 +423,8 @@ def validate_kv_segment_size_buckets(
         [2048]
         >>> validate_kv_segment_size_buckets([2048], [2048])
         [2048]
+        >>> validate_kv_segment_size_buckets([512, 2048], [128, 512])
+        [512, 2048]
     """
     param_name = "kv_segment_size_buckets"
 
@@ -451,31 +455,107 @@ def validate_kv_segment_size_buckets(
                 f"Please use one of these values."
             )
 
-    # --- Current kernel limitations ---
-
-    # 4. Only one segment size for now
-    if len(buckets) != 1:
-        # TODO: Add support for multiple segment sizes and implement
-        # bucket selection logic.
-        raise ValueError(
-            f"Only one segment size is currently supported, got "
-            f"{len(buckets)}: {buckets}."
-        )
-
-    # 5. If user explicitly set num_batched_tokens_buckets, it must match
+    # 4. Prefill buckets must be legal query lengths that fit the largest
+    #    segment size.
+    #    Previously this required an exact match against a single segment size, on
+    #    the premise that "the segmented kernel requires the prefill bucket length
+    #    to equal the segment size". That premise does not hold: the kernel derives
+    #    the active segment from seqlen_q and the prior segments from
+    #    prior_seg_size independently, then sizes SBUF as max() of the two. So the
+    #    only requirement is that each prefill bucket is a legal query length
+    #    (multiple of 128) that fits the segment it will run against.
+    #
+    #    Bound against max(buckets), not buckets[0]: with several compiled segment
+    #    sizes a bucket only has to fit the segment actually selected for it at
+    #    runtime, and pick_kv_segment_size() never returns a segment smaller than
+    #    the active query length (see its clamping contract). Bounding on the
+    #    smallest segment would reject legal ladders such as
+    #    nb=[128,512] x ks=[512,2048].
+    #
+    #    Warmup already compiles the cross product kv_seg x bucket and the NEFF
+    #    cache keys them separately, so multiple segment sizes need no further
+    #    plumbing here.
     if num_batched_tokens_buckets is not None:
-        # TODO: Remove this constraint once prefill bucket length is
-        # decoupled from prior segment size in the segmented kernel.
-        if num_batched_tokens_buckets != buckets:
+        seg_max = max(buckets)
+        bad = [b for b in num_batched_tokens_buckets if b > seg_max]
+        if bad:
             raise ValueError(
-                f"When {param_name} is set, num_batched_tokens_buckets must "
-                f"match because the segmented kernel currently requires the "
-                f"prefill bucket length to equal the segment size. "
-                f"Got num_batched_tokens_buckets={num_batched_tokens_buckets}, "
-                f"{param_name}={buckets}"
+                f"num_batched_tokens_buckets entries must not exceed the largest "
+                f"{param_name}={seg_max}; got {bad}."
+            )
+        illegal = [b for b in num_batched_tokens_buckets if b % 128 != 0]
+        if illegal:
+            raise ValueError(
+                f"num_batched_tokens_buckets entries must be multiples of 128 "
+                f"(the segmented kernel asserts seqlen_q % 128 == 0); "
+                f"got {illegal}."
             )
 
     return buckets
+
+
+def pick_kv_segment_size(
+    cached_seq_len: int,
+    kv_segment_size_buckets: list[int],
+    active_seq_len: int = 0,
+) -> int:
+    """Pick the kv_segment_size to use for one prefill step.
+
+    Chooses the compiled segment size that minimizes kernel launches over the
+    prior (already-cached) KV, preferring fewer iterations, then less wasted
+    tail, then larger segments:
+
+        num_segments = ceil(cached_seq_len / kv_segment_size)
+        tail_waste   = num_segments * kv_segment_size - cached_seq_len
+        score        = (num_segments, tail_waste, -kv_segment_size)
+
+    and returns the lexicographically smallest. With a single compiled size the
+    result is always that size, so behaviour is unchanged from the pre-``#5``
+    single-segment configuration.
+
+    ``active_seq_len`` clamps the result upwards: the segmented kernel requires
+    ``seqlen_q <= kv_segment_size`` (see ``attention_segmented_cte``), so a
+    segment smaller than the active query length is never legal even when it
+    scores better on the prior. The smallest compiled size that still admits the
+    query wins; if none does, the largest compiled size is returned and the
+    kernel wrapper's own validation reports the violation.
+
+    Args:
+        cached_seq_len: Number of prior (already-cached) KV tokens.
+        kv_segment_size_buckets: Compiled KV segment sizes (ascending).
+        active_seq_len: Active query length for this step (0 = unconstrained).
+
+    Returns:
+        The selected kv_segment_size.
+
+    Example:
+        >>> pick_kv_segment_size(0, [512, 2048])
+        512
+        >>> pick_kv_segment_size(4096, [512, 2048])
+        2048
+        >>> pick_kv_segment_size(0, [512, 2048], active_seq_len=1024)
+        2048
+    """
+    if not kv_segment_size_buckets:
+        raise ValueError("kv_segment_size_buckets cannot be empty")
+
+    # Only segments that can legally hold the active query are candidates.
+    legal = [s for s in kv_segment_size_buckets if s >= active_seq_len]
+    if not legal:
+        # Let the kernel wrapper raise with its own precise message.
+        return max(kv_segment_size_buckets)
+
+    if cached_seq_len <= 0:
+        # No prior to iterate over, so launch overhead dominates: take the
+        # smallest legal segment.
+        return min(legal)
+
+    def _score(kv_segment_size: int) -> tuple[int, int, int]:
+        num_segments = (cached_seq_len + kv_segment_size - 1) // kv_segment_size
+        tail_waste = num_segments * kv_segment_size - cached_seq_len
+        return num_segments, tail_waste, -kv_segment_size
+
+    return min(legal, key=_score)
 
 
 # NKI attention kernel tile constraint. Same constant as

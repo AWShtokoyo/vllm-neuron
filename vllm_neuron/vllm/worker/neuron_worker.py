@@ -1493,16 +1493,45 @@ class NeuronWorker(WorkerBase):
     def _prefill_compile_targets(self) -> list[tuple[int, int]]:
         """Enumerate (num_batched_tokens, kv_segment_size) pairs to compile.
 
-        Cartesian product of the configured prefill buckets and KV
-        segment buckets. Mirror of ``_decode_compile_targets`` — both
-        return the flat tuple list the trace pool consumes.
+        Cartesian product of the configured prefill buckets and KV segment buckets,
+        **minus the pairs that are unreachable at runtime**. Mirror of
+        ``_decode_compile_targets`` — both return the flat tuple list the trace pool
+        consumes.
+
+        🔴 Why pairs are filtered. The segmented attention kernel asserts
+        ``seqlen_q <= kv_segment_size``, and ``pick_kv_segment_size()`` clamps upwards so it
+        never selects a segment smaller than the active query length. A pair with
+        ``bucket_size > kv_seg_size`` therefore cannot occur in service — but tracing it raises
+        ``ValueError: Query sequence length (N) must not exceed kv_segment_size (M)``, which
+        aborts a parallel-trace lane and kills engine-core startup.
+
+        This is the compile-side counterpart of the runtime relaxation already carried in this
+        patch (a prefill bucket is bounded against ``max(kv_segment_size_buckets)``, not
+        ``buckets[0]``, because it only has to fit the segment selected for it at runtime).
+        Without this filter the effective constraint collapses back to ``max(nb) <= min(ks)``,
+        which forbids e.g. ``nb=[128,256,512,1024]`` with ``ks=[512,1024]`` even though every
+        reachable pair is legal. Measured 2026-08-20: that configuration died at startup.
         """
         num_batched_tokens_buckets, effective_kv_buckets = self._prefill_buckets()
-        return [
+        targets = [
             (bucket_size, kv_seg_size)
             for kv_seg_size in effective_kv_buckets
             for bucket_size in num_batched_tokens_buckets
+            # kv_seg_size == 0 is the non-segmented sentinel — never filter it.
+            if kv_seg_size == 0 or bucket_size <= kv_seg_size
         ]
+        dropped = (
+            len(effective_kv_buckets) * len(num_batched_tokens_buckets) - len(targets)
+        )
+        if dropped:
+            logger.info(
+                "Prefill compile targets: %s of %s pairs "
+                "(skipped %s unreachable bucket > kv_segment_size pair(s))",
+                len(targets),
+                len(effective_kv_buckets) * len(num_batched_tokens_buckets),
+                dropped,
+            )
+        return targets
 
     def _extract_graphs(
         self,
@@ -1722,11 +1751,33 @@ class NeuronWorker(WorkerBase):
             num_batched_tokens_buckets,
         )
 
-        total_warmups = len(effective_kv_buckets) * len(num_batched_tokens_buckets)
+        # 🔴 Skip (bucket, segment) pairs that are UNREACHABLE AT RUNTIME.
+        # The segmented attention kernel asserts `seqlen_q <= kv_segment_size`, and
+        # `pick_kv_segment_size()` clamps upwards so it never selects a segment smaller than the
+        # active query length. A pair with `bucket_size > kv_seg_size` therefore cannot occur in
+        # service -- but warming it up raises
+        #   ValueError: Query sequence length (N) must not exceed kv_segment_size (M)
+        # which aborts a parallel-trace lane and kills engine-core startup.
+        #
+        # This is the warmup-side counterpart of the runtime relaxation already carried in this
+        # patch (prefill buckets are bounded against max(kv_segment_size_buckets), not buckets[0],
+        # because a bucket only has to fit the segment selected for it at runtime). Without this
+        # skip the effective constraint collapses back to `max(nb) <= min(ks)`, which forbids
+        # e.g. nb=[128,256,512,1024] with ks=[512,1024] even though every reachable pair is legal.
+        # Measured 2026-08-20: that configuration died at startup before this skip was added.
+        # 🔴 Same filter as ``_prefill_compile_targets`` — see the docstring there. A pair with
+        # bucket_size > kv_seg_size is unreachable at runtime and raises in the kernel wrapper.
+        warmup_pairs = [
+            (kv_seg_size, bucket_size)
+            for kv_seg_size in effective_kv_buckets
+            for bucket_size in num_batched_tokens_buckets
+            if kv_seg_size == 0 or bucket_size <= kv_seg_size
+        ]
+        total_warmups = len(warmup_pairs)
         warmup_count = 0
 
-        for kv_seg_size in effective_kv_buckets:
-            for bucket_size in num_batched_tokens_buckets:
+        for kv_seg_size, bucket_size in warmup_pairs:
+            if True:  # keeps the original body indentation
                 warmup_count += 1
                 logger.info(
                     "\n[%s/%s] Warming up for prefill: bucket_size=%s, "

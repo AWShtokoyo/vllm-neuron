@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -7,6 +8,7 @@ from torch import Tensor
 from nkilib.core.mlp.mlp import mlp as nkilib_mlp
 from nkilib.core.utils.common_types import (
     ActFnType,
+    ComputationMode,
     DtypeMode,
     NormType,
     QuantizationType,
@@ -57,6 +59,28 @@ _MX_PACKED_SCALE_BYTES = 4
 # tiles of 128 partitions x 4 x4-packed fp8 bytes. The per-model MX weight loaders
 # (e.g. qwen3_vl) import these so the packed nn.Parameter shapes and the loader
 # swizzle share one definition.
+# ── EXPERIMENT ONLY (2026-08-08): force the MLP kernel choice ────────────────────────────────
+# nkilib picks TKG vs CTE on `batch_size * sequence_len <= TKG_BS_SEQLEN_THRESHOLD` (96,
+# mlp_parameters.py::is_mlp_tkg). For a 1-token decode step that means num_seqs vs 96, so a
+# num_seqs sweep across 96 changes the KERNEL as well as the amount of padding, and a throughput
+# delta cannot be attributed to either alone. This knob forces one side so the 2x2 can be measured:
+#
+#   FORCE_MLP_KERNEL=cte   -> force_cte_mode=True        (CTE even at small batch)
+#   FORCE_MLP_KERNEL=tkg   -> mode=ComputationMode.DECODE (TKG even at large batch; it is
+#                             is_mlp_tkg's first clause and bypasses the threshold entirely)
+#   unset / auto           -> stock behaviour, byte-identical to every recorded measurement
+#
+# 🔴 MUST be kept consistent with ministral3/model.py's `_runs_on_cte`, which recomputes the SAME
+# threshold to decide whether to fp8-pre-quantize the hidden. Forcing only this side desynchronises
+# them and reproduces the 2.32 port bug: a bf16 hidden reaching the kernel's fp8 source transpose
+# ("nc_matmul (transpose mode) dst dtype must match input dtype ... got dst=float8_e4m3 but
+# input=bfloat16"). model.py reads the same env var for exactly that reason.
+_FORCE_MLP_KERNEL = (os.environ.get("FORCE_MLP_KERNEL") or "auto").strip().lower()
+if _FORCE_MLP_KERNEL not in ("auto", "tkg", "cte"):
+    raise ValueError(
+        f"FORCE_MLP_KERNEL must be auto|tkg|cte, got {_FORCE_MLP_KERNEL!r}"
+    )
+
 _PMAX = 128  # partition dim (nl.tile_size.pmax)
 _Q_WIDTH = 4  # 4 float8_e4m3fn bytes per nl.float8_e4m3fn_x4 / uint32 element
 _TILE_SIZE = _PMAX * _Q_WIDTH  # 512 -- the 512-element H/I tile of the MX layout
@@ -205,7 +229,13 @@ def mlp(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
-            force_cte_mode=False,
+            # EXPERIMENT: see _FORCE_MLP_KERNEL above. Default path is unchanged (False/AUTO).
+            force_cte_mode=(_FORCE_MLP_KERNEL == "cte"),
+            mode=(
+                ComputationMode.DECODE
+                if _FORCE_MLP_KERNEL == "tkg"
+                else ComputationMode.AUTO
+            ),
             dtype_mode=DtypeMode.AUTO,
             **(
                 {"gate_up_w_layout": gate_up_w_layout}
@@ -308,6 +338,28 @@ def _can_use_kernel(
     if quantization_type == QuantizationType.MX:
         H_eff = H - _MX_PACKED_SCALE_BYTES if H % 128 == _MX_PACKED_SCALE_BYTES else H
         return H_eff % 128 == 0
+
+    # 🔴 2026-08-18: ROW shares MX's packed-activation layout, and this check used to reject it.
+    # For CTE + QuantizationType.ROW the kernel wants a PRE-QUANTIZED fp8 hidden carrying the
+    # per-row fp32 scale bit-cast into a trailing 4 bytes -- `[T, H+4]`
+    # (nkilib mlpp_input_has_packed_scale; the CTE loader splits it in
+    # mlp_cte/basic/mlp_cte_basic_tensor_io.py::load_packed_hidden_scales). Only the MX arm above
+    # stripped that tail, so a ROW-packed hidden failed `H % 128 != 0`, this function returned
+    # False, and the wrapper fell back to the PyTorch reference path -- which then died on
+    # `aten.mm` with `[128, 12292] X [12288, 896]` during FX tracing. The kernel was never the
+    # problem; the eligibility gate was.
+    # The `H % 128 == 4` guard is the same safety argument as MX's: a real unpacked hidden always
+    # has H % 128 == 0, so this arm cannot silently eat 4 genuine elements.
+    # ⚠️ Compare enum members directly — do NOT call ``quantization_type.is_logical_row()``.
+    # Dynamo cannot trace a bound method on a sourceless enum constant and dies with
+    # "SourcelessBuilder.create does not know how to wrap <class 'method'>" (gb0116), which
+    # surfaces only as a parallel-trace lane failure during compile (measured 2026-08-18).
+    # Every other branch in this function uses ``==`` for the same reason.
+    if (
+        quantization_type == QuantizationType.ROW
+        or quantization_type == QuantizationType.ROW_MX
+    ) and H % 128 == _MX_PACKED_SCALE_BYTES:
+        H = H - _MX_PACKED_SCALE_BYTES
 
     if H % 128 != 0:
         return False
