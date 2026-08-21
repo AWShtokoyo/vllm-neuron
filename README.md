@@ -45,6 +45,26 @@ Models listed below are tested end-to-end on Neuron hardware with correctness va
 
 Performance improvements are delivered incrementally with each Neuron release.
 
+## Contributed Models
+
+Community-contributed model ports maintained on separate branches of this fork,
+not merged into this release branch. Each branch natively integrates the model
+(model package + framework touch-points) and ships a model recipe, tutorial,
+offline example, and a self-contained test/artifact bundle. Check out the branch
+to build and serve the model.
+
+| Model | Type | Instance | vLLM-Neuron Plugin | Neuron SDK | Branch |
+|---|---|---|---|---|---|
+| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-devstral-ministral3`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
+| [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-llama-embed-nemotron`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
+| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31b-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-moe`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
+| [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-27b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-27b/Qwen3.6-27B/README.md) |
+
+> **Note:** These are contributed ports on feature branches, validated for
+> correctness by their contributors. They are not part of the officially supported
+> model set listed above.
+
 ## Features
 
 Feature support is at the framework level. See the model cards in [`docs/model-recipes/`](docs/model-recipes/) for per-model feature availability and the [features guide](docs/guides/features-guide.md) for configuration details.
