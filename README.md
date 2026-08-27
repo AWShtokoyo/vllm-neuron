@@ -57,20 +57,21 @@ to build and serve the model.
 
 | Model | Type | Instance | vLLM-Neuron Plugin | Neuron SDK | Branch |
 |---|---|---|---|---|---|
-| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-devstral-ministral3`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
-| [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-llama-embed-nemotron`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
-| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
-| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-moe`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
-| [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-27b`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-qwen36-27b/Qwen3.6-27B/README.md) |
-| [GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-glm-5-2`](https://github.com/AWShtokoyo/vllm-neuron/tree/add-glm-5-2/GLM-5.2/README.md) |
+| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-devstral-ministral3`](https://github.com/htokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
+| [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-llama-embed-nemotron`](https://github.com/htokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
+| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/htokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-qwen36-moe`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
+| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) / [FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-qwen38-27b`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen38-27b/Qwen3.8-27B/README.md) |
+| [GLM-5.2 FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-glm-5-2`](https://github.com/htokoyo/vllm-neuron/tree/add-glm-5-2/GLM-5.2/README.md) |
 
 > **Note:** These are contributed ports on feature branches, validated for
 > correctness by their contributors. They are not part of the officially supported
 > model set listed above. Each branch targets the plugin / Neuron SDK version in
-> its row — `add-llama-embed-nemotron` and `add-devstral-ministral3` are hosted on
-> **0.24.0.1.1.0 / Neuron 2.32** (this base); the remaining branches are still on
-> 0.21.0.1.0.0 / Neuron 2.31 and are re-hosted onto 0.24 individually. A branch's
-> pre-0.24 state is kept alongside it with a `-231` suffix.
+> its row — `add-llama-embed-nemotron`, `add-devstral-ministral3` and
+> `add-qwen38-27b` are hosted on **0.24.0.1.1.0 / Neuron 2.32** (this base); the
+> remaining branches are still on 0.21.0.1.0.0 / Neuron 2.31 and are re-hosted onto
+> 0.24 individually. A branch's pre-0.24 state is kept alongside it with a `-231`
+> suffix.
 
 ## Features
 
