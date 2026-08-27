@@ -45,6 +45,12 @@ _TKG_BS_SEQLEN_THRESHOLD = 128
 _MIN_H_FOR_I_SHARDING = 7168
 _MIN_I_FOR_I_SHARDING = 1024
 _MAX_T_FOR_I_SHARDING = 256
+# Intermediate-dim sharding thresholds mirroring nkilib
+# mlp_cte_sharding.calculate_sharding (non-MX branch): shard when I exceeds
+# _I_SHARD_MIN_INTERMEDIATE (and is 256-aligned), and unconditionally when I
+# exceeds _I_SHARD_FORCE_INTERMEDIATE (overrides the H >= 7168 gate).
+_I_SHARD_MIN_INTERMEDIATE = 2048
+_I_SHARD_FORCE_INTERMEDIATE = 4096
 
 # A ROW-packed MX activation carries a per-row fp32 dequant scale in a trailing
 # 4 bytes (one fp8 byte each), so the input is [T, H+4]. Not every MX caller packs
@@ -309,6 +315,16 @@ def _can_use_kernel(
         H_eff = H - _MX_PACKED_SCALE_BYTES if H % 128 == _MX_PACKED_SCALE_BYTES else H
         return H_eff % 128 == 0
 
+    # Plain ROW: a dynamically-quantized activation from rmsnorm_quant(ROW) is
+    # packed [T, H+4] (per-row fp32 dequant scale in the trailing 4 bytes), like
+    # MX -- but the gate/up/down weights stay plain 2D [H, I], so we only strip
+    # the packed tail for the 128-alignment check and then run the SAME TKG/CTE
+    # 2D checks as the unquantized path (unlike MX, which also bypasses the
+    # weight-derived PSUM check). ``H % 128 == 4`` can only fire on a genuine
+    # packed input; an unpacked [T, H] activation has ``H % 128 == 0``.
+    if quantization_type == QuantizationType.ROW and H % 128 == _MX_PACKED_SCALE_BYTES:
+        H = H - _MX_PACKED_SCALE_BYTES
+
     if H % 128 != 0:
         return False
 
@@ -318,15 +334,26 @@ def _can_use_kernel(
             return False
         return True
 
-    # CTE: PSUM bank constraint on intermediate dimension
+    # CTE: PSUM bank constraint on intermediate dimension. The kernel shards
+    # the intermediate dim across the 2 LNC cores when the sharding heuristic
+    # picks ShardedDim.INTERMEDIATE; we must predict that decision exactly so
+    # the PSUM-bank estimate below matches what the kernel actually tiles.
+    # Mirrors nkilib mlp_cte_sharding.calculate_sharding (non-MX branch; MX
+    # returned above): I-shard when (T <= 256 & no bias) OR (I > 2048 & I%256==0),
+    # forced OFF when H < 7168 or I < 1024, then forced ON when I > 4096. The
+    # final "I > 4096 -> always shard" override is the key one: it lets the
+    # kernel split a large intermediate (e.g. Qwen3.8-27B I_pr=4352 @ TP4) even
+    # though H=5120 < 7168, which the older H-gated heuristic missed and thus
+    # wrongly routed a packed-ROW activation to the torch fallback.
     I = gate_w.shape[1]
     has_bias = gate_b is not None or up_b is not None or down_b is not None
-    can_shard_on_i = (
-        H >= _MIN_H_FOR_I_SHARDING
-        and I >= _MIN_I_FOR_I_SHARDING
-        and T <= _MAX_T_FOR_I_SHARDING
-        and not has_bias
+    can_shard_on_i = (T <= _MAX_T_FOR_I_SHARDING and not has_bias) or (
+        I > _I_SHARD_MIN_INTERMEDIATE and I % 256 == 0
     )
+    if H < _MIN_H_FOR_I_SHARDING or I < _MIN_I_FOR_I_SHARDING:
+        can_shard_on_i = False
+    if I > _I_SHARD_FORCE_INTERMEDIATE:
+        can_shard_on_i = True
     effective_i = I // 2 if can_shard_on_i else I
     return math.ceil(effective_i / _SRC_PROJ_INT_DIM_TILE_SIZE) <= _NUM_HW_PSUM_BANKS
 

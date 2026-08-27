@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 
@@ -33,3 +33,15 @@ class NeuronAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         # HND layout
         return 2, num_blocks, num_kv_heads, block_size, head_size
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list:
+        """Neuron's decode-attention NKI kernel tiles the prior-context mask in
+        units of P_MAX=128 (functional/attention/attention_decode_mask.py:
+        ``s_prior % 128 == 0``). For hybrid models, Platform._align_hybrid_block_size
+        grows cache_config.block_size to satisfy the mamba page; declaring 128 as
+        the kernel alignment floor makes that grown block_size a 128-multiple, so
+        S_ctx = ceil(max_len/block)*block stays 128-aligned and the decode mask
+        kernel accepts it (no per-call mask/K-V padding needed). Mirrors the
+        upstream pattern (e.g. FlashAttention declares MultipleOf(16))."""
+        return [MultipleOf(128)]

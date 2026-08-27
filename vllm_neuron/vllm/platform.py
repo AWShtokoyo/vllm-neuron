@@ -129,6 +129,13 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # DeepSeek block-FP8 checkpoints (quant_method="fp8"). Neuron does NOT
+        # run block-[128,128] GEMMs; the load-time path CPU-dequants the block
+        # scales and re-quantizes to a supported scheme (e.g. Qwen3.5-dense
+        # per-channel ROW fp8), so the device sees a supported quant/bf16 graph.
+        # Like the other entries this only says "vLLM won't block it" — the
+        # model factory / neuron_config decides what actually runs.
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -172,11 +179,35 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        """Default block_size to 32 for Neuron when the user didn't override."""
+        """Default block_size to 32 for Neuron when the user didn't override.
+
+        For hybrid (GatedDeltaNet/Mamba) models, drive vLLM's OWN
+        Platform._align_hybrid_block_size to pad the mamba page to equal the
+        full-attention page so unify_kv_cache_spec_page_size accepts the mixed
+        KV-cache spec. We reuse the upstream arithmetic verbatim (no duplication):
+        the only Neuron-specific gap is that _find_non_ssm_backend can't discover
+        Neuron's plain-torch attention layer, so we pass NeuronAttentionBackend
+        explicitly. get_num_kv_heads() already returns the per-rank, replicated
+        value (max(1, total_kv // tp)) — identical to the runner's LayerSpec — so
+        the computed attn page matches the emitted FullAttentionSpec.
+        """
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_block_size:
-            return
-        cache_config.block_size = 32
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 32
+
+        model_config = vllm_config.model_config
+        if model_config is not None and getattr(model_config, "is_hybrid", False):
+            from vllm_neuron.vllm.attention.attn import NeuronAttentionBackend
+
+            # Real upstream alignment (interface.py): grows cache_config.block_size
+            # and sets cache_config.mamba_page_size_padded. NeuronAttentionBackend
+            # supplies is_ssm()/get_supported_kernel_block_sizes via AttentionBackend.
+            cls._align_hybrid_block_size(vllm_config, NeuronAttentionBackend)
+            logger.info(
+                "Hybrid align (upstream): block_size=%d mamba_page_size_padded=%s",
+                cache_config.block_size,
+                getattr(cache_config, "mamba_page_size_padded", None),
+            )
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -202,6 +233,26 @@ class NeuronPlatform(Platform):
         if vllm_config.optimization_level == OptimizationLevel.O2:
             vllm_config.optimization_level = OptimizationLevel.O1
             logger.info("Defaulting optimization level to O1 on Neuron")
+
+    @classmethod
+    def _vision_enabled(cls, model_config) -> bool:
+        """True only when the run actually accepts vision inputs.
+
+        A vision-capable checkpoint run text-only either resolves to a
+        non-multimodal arch (multimodal_config is None) or keeps a
+        multimodal_config with every per-prompt media limit forced to 0
+        (run.py: limit_mm_per_prompt={"image": 0, "video": 0}). Either way
+        no vision tower is built, so vision-bucket auto-config/validation
+        must be skipped.
+        """
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is None:
+            return False
+        # If any vision modality permits >=1 item per prompt, vision is live.
+        for modality in ("image", "video"):
+            if mm_config.get_limit_per_prompt(modality) > 0:
+                return True
+        return False
 
     @classmethod
     def _resolve_vision_auto_config(
@@ -343,6 +394,19 @@ class NeuronPlatform(Platform):
             cls._validate_component_dp_config(vllm_config)
         cls._maybe_enable_moe_for_component_dp(vllm_config)
 
+        # Mamba/GDN prefix caching: Neuron implements only the 'align' cache mode
+        # (and 'none'). The 'all' mode — per-i*block_size mamba block caching, gated
+        # upstream by supports_mamba_prefix_caching=True — is NOT yet ported (the
+        # full-width paged slab + per-boundary gather are unbuilt). Fail loud rather
+        # than silently mis-serve.
+        _mamba_mode = getattr(vllm_config.cache_config, "mamba_cache_mode", "none")
+        if _mamba_mode == "all":
+            raise NotImplementedError(
+                "mamba_cache_mode='all' is not supported on Neuron yet — only 'align' "
+                "(and 'none'). A model reaching 'all' declared supports_mamba_prefix_caching"
+                "=True; drop that flag so the framework selects 'align'."
+            )
+
         cls._validate_dcp_config(vllm_config)
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
@@ -371,6 +435,32 @@ class NeuronPlatform(Platform):
         # Set custom scheduler for Neuron platform
         scheduler_config = vllm_config.scheduler_config
 
+        # HYBRID + APC async-scheduling force-off (2026-07-08): on a hybrid model (full-attn + GDN)
+        # with prefix caching enabled, the async-scheduling batch-queue pipeline (batch_queue_size=2 via
+        # MultiprocExecutor.max_concurrent_batches) DEADLOCKS at the decode step that crosses a mamba
+        # block_size (256) boundary during generation. Root-caused by py-spy: all workers idle in the
+        # RPC dequeue while EngineCore blocks in step_with_batch_queue->get_response waiting for a
+        # response that never arrives — a batch-queue response-slot desync specific to the APC
+        # block-boundary decode. Confirmed fix: async_scheduling=False (batch_queue_size=1, no pipeline
+        # overlap) generates correctly across the boundary. Async pipelining is a throughput
+        # optimization; correctness wins. Scoped to hybrid + prefix-caching so non-hybrid / non-APC are
+        # unaffected. (Mirrors the chunked-prefill force-off pattern for is_hybrid.)
+        _mc = vllm_config.model_config
+        _cc = vllm_config.cache_config
+        if (
+            _mc is not None
+            and getattr(_mc, "is_hybrid", False)
+            and _cc is not None
+            and getattr(_cc, "enable_prefix_caching", False)
+            and scheduler_config.async_scheduling
+        ):
+            logger.warning(
+                "Disabling async_scheduling for hybrid model + prefix caching: the async batch-queue "
+                "pipeline deadlocks at the decode block-boundary crossing under APC (py-spy-confirmed). "
+                "Forcing synchronous scheduling (batch_queue_size=1)."
+            )
+            scheduler_config.async_scheduling = False
+
         if scheduler_config.enable_chunked_prefill:
             logger.warning(
                 "Chunked prefill is enabled on Neuron platform. Currently Neuron only supports"
@@ -385,7 +475,16 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Only resolve/validate vision buckets when vision inputs are actually
+        # enabled. A text-only run of a vision-capable checkpoint keeps the
+        # inert hf_config.vision_config but disables all multimodal inputs
+        # (limit_mm_per_prompt image+video == 0, or no multimodal_config at
+        # all when the arch resolves to the neuron text decoder). In that case
+        # no vision tower is built, so the vision-bucket validation must not
+        # gate the text path.
+        if hasattr(model_config.hf_config, "vision_config") and cls._vision_enabled(
+            model_config
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute per-image embed limit for request validation.
