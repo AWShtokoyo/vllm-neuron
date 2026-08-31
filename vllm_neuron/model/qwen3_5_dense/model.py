@@ -208,6 +208,31 @@ logger = logging.getLogger(__name__)
 # kernel/scales" from "shared fp8 checkpoint load" when debugging a regression.
 _FP8_MLP_BF16 = os.environ.get("VLLM_QWEN38_FP8_MLP_BF16") == "1"
 
+# EXPERIMENTAL (default OFF; the shipped path is unaffected when unset): run the CTE
+# (prefill / large-batch decode) MLP on the nkilib ROW fp8 kernel instead of the manual
+# dequant-to-bf16 SwiGLU.
+#
+# The manual path exists because an early attempt at the fp8 CTE kernel produced garbage
+# logits. The cause was the CALL CONVENTION, not this model's dims: CTE does not quantize a
+# bf16 activation (it cannot, because the quantization would have to happen before its PE
+# transpose), so it requires a PRE-QUANTIZED packed activation of shape [T, H+4] with the
+# per-row fp32 dequant scale in the trailing 4 fp8 bytes. nkilib documents that contract in
+# mlp_torch.py::_extract_precomputed_row_scale, and the in-tree llama3 static-fp8 model
+# already follows it (model_static_fp8.py: explicit rmsnorm_quant -> NF.mlp with NO_NORM).
+# Verified against nkilib's own torch reference at this model's exact dims (H=5120,
+# I/TP=4352): the call is accepted and the result is a valid approximation.
+#
+# ⚠️ This is NOT a free win, which is why it is opt-in rather than the default. ROW quantizes
+# the ACTIVATION as well as the weights, so prefill activations become fp8 where today they
+# are bf16. Measured on that reference: relative error against an fp32 baseline rises from
+# 5.4e-3 (manual bf16 dequant) to 4.6e-2 — an 8.6x increase, consistent with per-row fp8 of a
+# 5120-wide vector rather than with a defect. Decode (TKG) already quantizes activations this
+# way, so this makes prefill consistent with decode; but prefill writes the KV cache that
+# every later token reads, so the accuracy effect has to be MEASURED (GSM8K), not assumed.
+# What it buys: the MLP matmuls run in fp8 instead of bf16 (the MLP is ~2/3 of prefill GEMM
+# work), and the transient bf16 materialisation of gate/up/down disappears.
+_FP8_MLP_CTE_KERNEL = os.environ.get("VLLM_QWEN38_FP8_MLP_CTE") == "1"
+
 
 # =============================================================================
 # Vendored attention_tkg (d_head=256) flash DECODE kernel wiring (opt-in).
@@ -1217,6 +1242,31 @@ def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).sum(dim=dim, keepdim=True) + eps)
 
 
+# ---------------------------------------------------------------------------
+# cte prefill kernel (the default). Wrapped **once at module import**.
+#
+# 🔴 Why the wrapping cannot move into forward (both failures were measured):
+#      1) Calling the raw @nki.jit kernel from a traced forward dies with
+#         `Dynamo does not know how to trace the builtin sys._getframe`
+#         (nki.jit's call path uses it). Every kernel in this repo is wrapped with
+#         libtorch_neuronx_lite's wrap_nki for exactly this reason
+#         (gated_delta_rule_seq.py records the same finding).
+#      2) Wrapping inside forward hits the fake-tensor wall, and wrapping lazily
+#         (`if _W is None: _W = wrap_nki(...)`) makes Dynamo guard on that global and
+#         then mutate it mid-trace: warmup bakes the is-None branch, the guard flips on
+#         the real call, and vLLM's 'fail_on_recompile' turns it into EngineDead.
+# ⚠️ The with-/without-initial_state calls take a different number of inputs, so they are
+#    different graphs. Keep two wrapped instances so neither triggers a recompile
+#    (the sequential kernel carries two for the same reason).
+from vllm_neuron.functional.linear_attention._gated_delta_rule_grouped_kernel import (
+    grouped_gated_delta_rule_kernel as _grouped_kernel,
+)
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki as _wrap_nki
+
+_GDN_GROUPED_WRAPPED = _wrap_nki(_grouped_kernel)
+_GDN_GROUPED_WRAPPED_INIT = _wrap_nki(_grouped_kernel)
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear attention layer.
 
@@ -1437,7 +1487,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # One-hot gather of the seed block row (exact 0/1, one nonzero per row),
         # identical mechanism to the decode _gather_rows matmul path.
         N = self.recurrent_state.shape[0]
-        if _unified_kv_gather_on() and getattr(self, "_rec_raw_slab", None) is not None:
+        if (_unified_kv_gather_on()
+                and getattr(self, "_rec_raw_slab", None) is not None):
             # UNIFIED: gather seed row from the CONTIGUOUS raw slab (recurrent component) via .ap
             # page-stride gather — raw slab (not the strided recurrent_state view) so no rejected
             # reshape. row_elems=state size, page_stride=raw row width, state_off=recurrent column.
@@ -1445,8 +1496,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             for _d in self.recurrent_state.shape[1:]:
                 _re *= _d
             _rs = self._rec_raw_slab
+            # 🔴 The read index needs _anchor_idx too, not just the write side.
+            #    The _anchor_idx docstring records the device proof of this effect:
+            #      "in PREFILL WARMUP the slot indices (state_indices / seed_state_indices) derive
+            #       purely from arange constants and fold to CPU consts ...
+            #       Device-proven: const_idx probe FAILS, const_idx_fixed (anchored) PASSES"
+            #    The write side (the scatter in _seed_state) was already anchored, but the read
+            #    side was passing the index through bare. Once the index folds to a warmup
+            #    constant, every execution reads the same (wrong) slot, so the seed comes from
+            #    an unwritten region. That matches what was measured: the second chunk's seed
+            #    exceeded 1e4 (normal is <=100), clamping fixed it, and zeros fixed it too.
+            #    Anchor against `has_init`, which derives from a forward input; the value is
+            #    unchanged (it adds 0).
+            _sidx = seed_idx.to(torch.int32).reshape(1, 1)
+            _sidx = _anchor_idx(_sidx, has_init)
             _g = _paged_state_gather_kernel()[2](
-                _rs, seed_idx.to(torch.int32).reshape(1, 1), 1, _re,
+                _rs, _sidx, 1, _re,
                 int(_rs.shape[1]), int(self._rec_raw_off),
             )
             seed = _g.reshape(1, *self.recurrent_state.shape[1:]).to(torch.float32)
@@ -1817,6 +1882,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # sequential boundary state did NOT fix it (measured),
             # confirming the OUTPUT path, not the state, is the culprit. The stable path is
             # the sequential NKI path below.
+        elif self._gdn_prefill_mode() == "grouped":
+            # GROUPED MODE (the default): the chunk-group prefill kernel. Same chunked
+            # reformulation as `parallel`, but the intra-chunk solve is split (forward
+            # substitution between 16x16 sub-blocks, recursive doubling inside each) and eight
+            # chunks are processed as one group so their per-sub-block work packs onto the
+            # 128-partition axis. At the shipped shape that is ~2.4x less kernel time than
+            # `parallel` and ~13x less than `sequential`.
+            # It is run in fp32 (see _grouped_gated_delta_rule_nki): in bf16 the chunked form
+            # carries ~1e-2 relative error and this model's decode collapses past ~10 chunks,
+            # exactly the failure the `parallel` note above describes but reached sooner. fp32
+            # brings it to ~4e-6 — below `parallel`'s bf16 error and level with `sequential` —
+            # for about 15% more kernel time.
+            # The recurrent state it writes follows the SAME convention as the other two
+            # kernels (verified on device), so the decode branch below treats `grouped` and
+            # `parallel` alike.
+            core_attn_out, last_state = self._grouped_gated_delta_rule_nki(
+                query.contiguous(), key.contiguous(), value.contiguous(),
+                g.contiguous(), beta.contiguous(),
+                output_final_state=(self.recurrent_state is not None),
+                initial_state=_apc_init,
+            )
         else:
             # SEQUENTIAL-recurrence NKI kernel (segmented recurrence INSIDE the kernel):
             # bounded traced graph at any seq_len AND sequential-scan values (no chunked
@@ -2168,7 +2254,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # decode steps. The kernel needs seq_len == 1 and
             # a non-None fp32 initial state; spec-decode or a missing rec_init falls back to the
             # sequential torch scan, which is also what "sequential" mode uses throughout.
-            if (self._gdn_prefill_mode() == "parallel"
+            # `cte` is grouped with `parallel`: both write the chunk-reformulation state
+            # convention, verified equivalent on device (mutual state difference 4.96e-3, about
+            # the sum of each kernel's own error against an fp32 sequential reference). Feeding
+            # either one's last_state to the sequential torch scan drifts to NaN over decode.
+            if (self._gdn_prefill_mode() in ("parallel", "grouped")
                     and seq_len == 1 and rec_init is not None):
                 from vllm_neuron.functional.linear_attention import (
                     recurrent_gated_delta_rule as _nad_recur_gdr,
@@ -2254,17 +2344,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
 
 
-    _GDN_PREFILL_MODES = ("sequential", "parallel")
+    # Listed in the order they were added; the default comes from the env lookup below,
+    # not from this order.
+    _GDN_PREFILL_MODES = ("sequential", "parallel", "grouped")
 
     @classmethod
     def _gdn_prefill_mode(cls) -> str:
-        """Which GatedDeltaNet prefill kernel to use: ``sequential`` (default) or ``parallel``.
+        """Which GatedDeltaNet prefill kernel to use: ``grouped`` (default), ``parallel``
+        or ``sequential``.
 
         Set ``VLLM_GDN_PREFILL``. An unrecognised value raises rather than silently falling
         back, so a typo cannot quietly change which kernel — and therefore which numerics — a
         deployment runs. See the dispatch comment in ``forward_prefill`` for the trade-off.
         """
-        mode = os.environ.get("VLLM_GDN_PREFILL", "sequential").strip().lower()
+        mode = os.environ.get("VLLM_GDN_PREFILL", "grouped").strip().lower()
         if mode not in cls._GDN_PREFILL_MODES:
             raise ValueError(
                 f"VLLM_GDN_PREFILL={mode!r} is not recognised; "
@@ -2315,6 +2408,128 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         last_recurrent_state = state_h.unsqueeze(0) if output_final_state else None
         return core_attn_out, last_recurrent_state
 
+    @staticmethod
+    def _grouped_kernels():
+        """The two pre-wrapped instances of the grouped prefill kernel.
+
+        Wrapped at module import (see the comment next to the wrapping): resolving or
+        wrapping inside the traced forward breaks TorchDynamo. The with-/without-carry
+        calls take a different number of inputs, so each needs its own instance to stay
+        recompile-free.
+        """
+        return _GDN_GROUPED_WRAPPED, _GDN_GROUPED_WRAPPED_INIT
+
+    # gdn_cte requires the token axis to be a multiple of its chunk width.
+    _GROUPED_CHUNK = 64
+
+    def _grouped_gated_delta_rule_nki(
+        self, query, key, value, g, beta, output_final_state=False, initial_state=None,
+    ):
+        """``VLLM_GDN_PREFILL=grouped`` (the default): the chunk-group prefill kernel.
+
+        Contract differences from the ``parallel`` kernel, all absorbed here so the call site
+        stays uniform:
+          * This kernel does NOT l2norm q/k and does NOT pre-scale q — it takes ``scale`` as an
+            argument. The prologue normalises q/k and passes ``scale`` instead of handing over
+            raw tensors the way the ``parallel`` path does.
+          * Layout is head-major with no batch axis: q/k/v are ``[H, T, D]`` and the state is
+            ``[H, Dk, Dv]``, against ``[B, T, H, D]`` / ``[B, H, Dk, Dv]`` here. Prefill is
+            B == 1, so the batch axis is dropped and restored.
+          * T must be a multiple of ``_GROUPED_CHUNK``. The pad rows set beta = 0 and gate = 0,
+            which makes them state-preserving: beta = 0 gives delta = 0 so the state is not
+            updated, and gate = 0 gives exp(0) = 1 so it is not decayed either. Verified on
+            device: up to 1,728 pad rows leave the returned state within bf16 noise of a
+            reference over the real rows only, and it makes no difference whether the pad rows'
+            q/k/v are zeros or arbitrary values. Padding with anything else would silently
+            corrupt the carried-out state, which feeds every later prefill chunk AND decode.
+        """
+        kern_init = self._grouped_kernels()[1]     # the carry-taking instance; see below
+        # 🔴 l2norm must be computed in fp32. Normalising in bf16 drops a 128-element norm to
+        #    about three significant digits and that error enters the recurrence directly.
+        #    Measured: the bf16-normalised version died on a 6,319-token prompt with
+        #    "Token IDs out of range. Found min=1058881166" (NaN logits -> out-of-vocabulary
+        #    argmax -> EngineCore death), while short prompts passed — a length-dependent
+        #    failure. The other two kernels avoid this by normalising inside the kernel
+        #    (``parallel``) or by normalising outside and casting to fp32 (``sequential``).
+        query = l2norm(query.to(torch.float32), dim=-1, eps=1e-6)
+        key = l2norm(key.to(torch.float32), dim=-1, eps=1e-6)
+        # [B,T,H,*] -> [B,H,T,*]; force contiguous for the same reason the parallel path does
+        # (strided views read with the wrong strides on device -> garbage state -> NaN decode).
+        q, k, v, b_, g_ = [x.transpose(1, 2).contiguous() for x in (query, key, value, beta, g)]
+        B, Hh, T, D = k.shape
+        if B != 1:
+            raise RuntimeError(f"grouped prefill expects B == 1, got {B}")
+        Tp = ((T + self._GROUPED_CHUNK - 1) // self._GROUPED_CHUNK) * self._GROUPED_CHUNK
+        # 🔴 Do not try to instrument this region. All three mechanisms fail:
+        #    1. ``print``                     -> Dynamo cannot trace the builtin
+        #    2. a ``torch.where`` probe       -> neuronx-cc internal error NCC_IBCG902
+        #    3. a ``@torch._dynamo.disable``d call
+        #       -> "Skip calling `torch.compiler.disable()`d function": the model is compiled
+        #          with fullgraph=True, so the graph break kills every worker at EngineCore init.
+        #    To learn what shapes arrive, read them outside the compiled region (the worker's
+        #    execute_model, or the scheduler's padded token counts) instead.
+        in_dtype = value.dtype if value.dtype != torch.float32 else self.dtype
+
+        def _pad_t(x, fill):
+            if Tp == T:
+                return x
+            pad = torch.full((*x.shape[:-2], Tp - T, x.shape[-1]), fill,
+                             dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=-2)
+
+        def _pad_t2(x, fill):      # [H, T] tensors (beta, gate)
+            if Tp == T:
+                return x
+            pad = torch.full((x.shape[0], Tp - T), fill, dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=-1)
+
+        # 🔴 fp32 in, not the model dtype. This kernel takes its working precision from
+        #    ``dtype = q.dtype``, and in bf16 the chunked form carries ~1e-2 relative error
+        #    against an fp64 reference — which this model's decode does not tolerate: prompts
+        #    past ~10 chunks garble and longer ones reach NaN. fp32 brings it to ~4e-6 for
+        #    about 15% more kernel time, which is what makes this kernel shippable as the
+        #    default. See "Choosing among the three kernels" in the model README.
+        _kern_dtype = torch.float32
+        q_h = _pad_t(q[0], 0.0).to(_kern_dtype).contiguous()
+        k_h = _pad_t(k[0], 0.0).to(_kern_dtype).contiguous()
+        v_h = _pad_t(v[0], 0.0).to(_kern_dtype).contiguous()
+        beta_h = _pad_t2(b_[0].to(torch.float32), 0.0).contiguous()   # pad beta = 0 -> no update
+        gate_h = _pad_t2(g_[0].to(torch.float32), 0.0).contiguous()   # pad gate = 0 -> no decay
+        # 🔴 Always pass a tensor — never branch on ``initial_state is None`` here.
+        #    ``if initial_state is None`` is a Python-level branch, so it is decided AT TRACE
+        #    TIME. The warmup batch has no APC metadata, so the seed is None there and a graph
+        #    WITHOUT the carry input gets baked; at run time the carry then has nowhere to go
+        #    and every chunk after the first restarts from zero. Measured: a 310-token prompt
+        #    (one chunk) answered normally while 706 tokens and up returned zero non-whitespace
+        #    characters, with the boundary exactly at the chunk count. The ``parallel`` path
+        #    avoids the same trap by materialising zeros (gated_delta_rule.py).
+        #    ⚠️ Only the carry-taking instance is used, so there is one graph. Using both
+        #       instances here would reintroduce the "only one of them gets baked" bug.
+        if initial_state is None:
+            init_h = torch.zeros(Hh, D, D, dtype=torch.float32, device=q.device)
+        else:
+            init_h = initial_state[0].contiguous().to(torch.float32)  # [H, Dk, Dv]
+        # 🔴 Copy the carry into a buffer of its own. Identified by comparing version-matched FX
+        #    graphs: the working and broken graphs were identical except for the number of users
+        #    on the carry's ``where`` output, and ``init_h`` IS that output — the
+        #    ``.contiguous().to(torch.float32)`` above are both no-ops here (already fp32 and
+        #    contiguous), so no copy was made. As a single-use temporary the buffer can be
+        #    reused and overwritten by the compiler. Adding a second consumer prevented the
+        #    reuse, which is why mixing in another kernel appeared to "fix" it; taking an
+        #    independent buffer is the direct form of the same thing.
+        init_h = init_h.clone()
+        out_h, state_h = kern_init(q_h, k_h, v_h, beta_h, gate_h, init_h, 1.0 / (D ** 0.5))
+        # 🔴 Copy both outputs immediately, before any view. One NKI call returns two tensors,
+        #    and the ``parallel`` path warns about the same hazard: if neuronx-cc aliased the two
+        #    output buffers, the state write can clobber ``core_attn_out`` after the kernel
+        #    returns but before it is consumed. Cloning after a slice and a transpose would be
+        #    too late if the clobber already happened.
+        out_h = out_h.clone()
+        state_h = state_h.clone()
+        core_attn_out = out_h[:, :T, :].unsqueeze(0).transpose(1, 2).contiguous().to(in_dtype)
+        core_attn_out = core_attn_out.clone()
+        last_recurrent_state = state_h.unsqueeze(0).clone() if output_final_state else None
+        return core_attn_out, last_recurrent_state
 
 
     def _recurrent_gated_delta_rule(
@@ -2494,6 +2709,20 @@ class Qwen3_5DenseMLP(nn.Module):
 
         # SP: the residual stream is token-sharded (T/world) on prefill; gather
         # the full sequence before the dense matmul, scatter the result back.
+        #
+        # 🔑 With the opt-in fp8 CTE kernel the norm+quant happens BEFORE the gather, in the SP
+        # region, exactly as the in-tree llama3 static-fp8 model does. RMSNorm and ROW quant are
+        # both per-token, so moving them ahead of the collective is mathematically identical, and
+        # it halves the all-gather bytes (fp8 [T/world, H+4] instead of bf16 [T/world, H]).
+        _cte_prequantized = False
+        if is_prefill and self.is_fp8_row and _FP8_MLP_CTE_KERNEL:
+            hidden_states = NF.rmsnorm_quant(
+                hidden_states,
+                ln_w=(1.0 + self.post_attention_layernorm.weight),
+                eps=self.rms_norm_eps,
+                quantization_type=QuantizationType.ROW,
+            )
+            _cte_prequantized = True
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
 
@@ -2504,23 +2733,52 @@ class Qwen3_5DenseMLP(nn.Module):
             #
             # Path split on the nkilib CTE/TKG boundary (B*S vs
             # TKG_BS_SEQLEN_THRESHOLD):
-            #   * prefill / large-batch decode -> CTE. The nkilib NF.mlp(ROW)
-            #     CTE path produces INCORRECT logits for this model's dims on
-            #     trn2 (device-verified: the very first sampled token, which
-            #     comes from prefill, is garbage token id -1131398458, while a
-            #     manual dequant with the IDENTICAL fp8 weights + [128,out] ROW
-            #     scales is accurate). So CTE uses a manual dequant-to-bf16
-            #     SwiGLU. Weights stay resident as fp8 (the HBM saving that lets
-            #     3xlarge hold longer context); only a transient bf16 view is
-            #     materialized per projection.
+            #   * prefill / large-batch decode -> CTE, which by default uses a
+            #     manual dequant-to-bf16 SwiGLU. Weights stay resident as fp8 (the
+            #     HBM saving that lets 3xlarge hold longer context); only a
+            #     transient bf16 view is materialized per projection.
+            #     HISTORY: an early attempt at the nkilib ROW CTE kernel produced
+            #     garbage logits on trn2 (the very first sampled token, which comes
+            #     from prefill, was token id -1131398458) and was recorded as "wrong
+            #     for this model's dims". That attribution was WRONG: the cause is
+            #     the CALL CONVENTION. CTE cannot quantize a bf16 activation — the
+            #     quantization would have to precede its PE transpose — so it
+            #     requires a PRE-QUANTIZED packed [T, H+4] activation carrying the
+            #     per-row fp32 scale in the trailing 4 fp8 bytes. Feeding it bf16
+            #     with norm_type=RMS_NORM (the TKG contract) is what produced the
+            #     garbage. See _FP8_MLP_CTE_KERNEL for the corrected call, which is
+            #     opt-in because it also moves prefill activations to fp8.
             #   * small-batch decode (T <= threshold, e.g. T=1) -> TKG. This is a
             #     SEPARATE nkilib impl (mlp_tkg, not mlp_cte) that fuses RMSNorm +
-            #     per-row activation quant online from a bf16 input; it never saw
-            #     clean input before (prefill garbage poisoned the KV cache), so
-            #     it is exercised here on the correct manual-CTE state.
+            #     per-row activation quant online from a bf16 input.
             gamma = 1.0 + self.post_attention_layernorm.weight
+            # ⚠️ shape[0] is the PACKED width's row count, which is unaffected by the +4 tail, so
+            # the CTE/TKG decision is unchanged when the activation arrives pre-quantized.
             use_cte = is_prefill or hidden_states.shape[0] > TKG_BS_SEQLEN_THRESHOLD
-            if use_cte:
+            if use_cte and (_cte_prequantized or (_FP8_MLP_CTE_KERNEL and not is_prefill)):
+                # fp8 CTE kernel. The activation must already be packed [T, H+4]; on prefill that
+                # happened in the SP region above. Large-batch DECODE reaches here un-normalized,
+                # so quantize now. norm_type=NO_NORM because the norm is already folded in.
+                if not _cte_prequantized:
+                    hidden_states = NF.rmsnorm_quant(
+                        hidden_states, ln_w=gamma, eps=self.rms_norm_eps,
+                        quantization_type=QuantizationType.ROW,
+                    )
+                output = NF.mlp(
+                    hidden_states,
+                    self.gate_proj_weight,
+                    self.up_proj_weight,
+                    self.down_proj_weight,
+                    quantization_type=QuantizationType.ROW,
+                    gate_w_scale=self.gate_proj_weight_scale,
+                    up_w_scale=self.up_proj_weight_scale,
+                    down_w_scale=self.down_proj_weight_scale,
+                    norm_type=NormType.NO_NORM,
+                    ln_w=None,
+                    eps=self.rms_norm_eps,
+                    output_dtype=self.dtype,
+                )
+            elif use_cte:
                 # Manual dequant (w_fp8 * per-out-channel ROW scale) -> bf16 SwiGLU.
                 # Scale rows are identical broadcasts; row 0 = per-output-channel.
                 normed = self.post_attention_layernorm(hidden_states).to(torch.bfloat16)

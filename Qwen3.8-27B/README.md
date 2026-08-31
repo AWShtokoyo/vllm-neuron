@@ -12,6 +12,16 @@ family: Qwen3.5-27B, Qwen3.6-27B and Qwen3.8-27B, BF16 and FP8, all served throu
 > [`add-qwen36-27b-231`](https://github.com/htokoyo/vllm-neuron/blob/add-qwen36-27b-231/Qwen3.6-27B/README.md)
 > tag instead: it holds the predecessor `Qwen3.6-27B` port for that stack, which this branch supersedes.
 
+## Change History
+
+Newest first. Each entry links to the section with the full detail.
+
+| Date | Change |
+|---|---|
+| 2026-08-31 | **New `grouped` prefill kernel, now the default**, replacing `sequential`. A third in-tree NKI kernel: it batches eight 64-token chunks into one group, splits the intra-chunk solve, and carries the recurrent state across chunked-prefill boundaries. **1.18–2.89× the output throughput** and **3.5–5.2× lower TTFT p50** than the previous default, at the same GSM8K score. See [Prefill kernel selection](#prefill-kernel-selection-vllm_gdn_prefill) and [Choosing among the three kernels](#choosing-among-the-three-kernels). |
+| 2026-08-28 | Re-hosted onto Neuron 2.32 / vllm-neuron 0.24, and extended in the same release: **FP8** alongside BF16 on one code path, **vision** (image and video), the **`parallel`** chunked prefill kernel, and the paged prefix-KV gather. Chunked prefill verified to `max-model-len` 32768. See [Verification scope](#verification-scope). |
+| 2026-08-22 | Initial contribution, on vllm-neuron 0.21 / Neuron 2.31, as `Qwen3.6-27B` (ported and verified on device 2026-07-24/25). Adds the `qwen3_5_dense` package — the hybrid dense backbone — in **BF16** at TP=4 and TP=8. Superseded by this branch, kept at the [`add-qwen36-27b-231`](https://github.com/htokoyo/vllm-neuron/blob/add-qwen36-27b-231/Qwen3.6-27B/README.md) tag. |
+
 ## Introduction
 
 Qwen3.8-27B is a **hybrid dense** decoder: 64 layers made of 48 GatedDeltaNet (linear
@@ -64,9 +74,9 @@ device, 4 NeuronCores, 96 GB HBM), **TP=4**, LNC=2, on the Neuron 2.32 stack.
 |---|---|
 | FP8 serving | Compiles and serves; coherent text at every configuration below |
 | BF16 serving | The BF16 recipe serves on device with a real BF16 release |
-| Long context | `max-model-len` up to 32768; the opt-in prefill kernel was exercised there too |
-| Accuracy at long context | GSM8K 4-shot with a ~25,000-token irrelevant prefix, on both prefill kernels — a few points below the short-prompt figure and inside the measurement error, see [Accuracy at long context](#accuracy-at-long-context) |
-| Batching | `max-num-seqs` 1, 4 and 8 — coherent at every step, including a 6,300-token prompt with several requests prefilling concurrently |
+| Long context | `max-model-len` up to 32768, on all three prefill kernels |
+| Accuracy at long context | GSM8K 4-shot with a ~25,000-token irrelevant prefix, on all three prefill kernels — a few points below the short-prompt figure and inside the measurement error, see [Accuracy at long context](#accuracy-at-long-context) |
+| Batching | `max-num-seqs` 1, 4 and 8 — coherent at every step, including a 6,300-token prompt with several requests prefilling concurrently. The default kernel was measured at 1 and 8; 4 was exercised in the earlier release |
 | Memory | HBM measured per rank via `neuron-monitor`, summed across all four ranks |
 | Throughput / latency | Output tok/s, TTFT p50 and TPOT at concurrency 1 and 8, natural-text prompts |
 | Accuracy | GSM8K-CoT at n=100, and a BF16-vs-FP8 comparison on the same checkpoint (see [Accuracy Evaluation](#accuracy-evaluation)) |
@@ -151,17 +161,22 @@ The fp8 dynamic range on trn2 is the legacy `float8_e4m3` range (max 240), so se
 
 ### Prefill kernel selection (`VLLM_GDN_PREFILL`)
 
-The GatedDeltaNet layers admit two prefill formulations, and this port implements both:
+The GatedDeltaNet layers admit more than one prefill formulation, and this port carries **three NKI
+kernels** for them — listed below in the order they were added, so the progression is visible:
 
 | Mode | How it computes the recurrence |
 |---|---|
-| `sequential` (**default**) | The recurrence exactly as defined, advanced one token at a time inside a single bounded NKI kernel (`nl.sequential_range`) |
-| `parallel` (opt-in) | An algebraically equivalent chunked form: within each 64-token chunk the inter-token coupling is resolved by solving `T = (I − A)⁻¹` in fp32 by blocked forward substitution, so chunks are processed as matmuls instead of as a step loop |
+| `sequential` | The recurrence exactly as defined, advanced one token at a time inside a single bounded NKI kernel (`nl.sequential_range`) |
+| `parallel` | An algebraically equivalent chunked form: within each 64-token chunk the inter-token coupling is resolved by solving `T = (I − A)⁻¹` by blocked forward substitution, so chunks are processed as matmuls instead of as a step loop |
+| `grouped` (**new**, **default**) | The chunked form as well, but the intra-chunk solve is split — forward substitution *between* 16×16 sub-blocks, recursive doubling *inside* each — and eight chunks are processed as one group so their per-sub-block work packs onto the 128-partition axis. It also takes a carry-in state, so a chunked prefill resumes from the previous boundary instead of restarting |
 
-Decode follows whichever mode is selected — the two are not independently settable, because a prefill
-state produced by one form and advanced by the other diverges to NaN after a few tens of decode steps.
-Which one to pick, and what it costs, is in
-[Choosing between the two kernels](#choosing-between-the-two-kernels).
+All three compute the same recurrence; they differ in how much of it is turned into matmuls. `grouped` is
+the default because it is both the fastest and the most accurate of the three — see
+[Choosing among the three kernels](#choosing-among-the-three-kernels).
+
+Decode follows whichever mode is selected — the three are not independently settable, because a prefill
+state produced by one form and advanced by the decode path of another diverges to NaN after a few tens
+of decode steps.
 
 ## Feature status
 
@@ -228,11 +243,11 @@ export VLLM_CACHE_ROOT=/path/to/cache/vllm
 export NKI_COMPILE_CACHE_URL=/path/to/cache/nki
 
 # Required recipe flags for this model — all three are load-bearing
-# GatedDeltaNet prefill kernel. Unset means "sequential": the exact recurrence, evaluated one
-# step at a time, and the conservative default. "parallel" is an algebraically equivalent chunked
-# reformulation that is markedly faster on long prefills but solves a matrix inverse in fp32 per
-# chunk; both score the same on GSM8K. See Prefill kernel selection below.
-# export VLLM_GDN_PREFILL=parallel
+# GatedDeltaNet prefill kernel. Unset means "grouped": the chunk-group form, which is the
+# fastest of the three and the one the figures below are measured on. "parallel" and
+# "sequential" are the earlier kernels, kept for comparison and for anyone who wants the exact
+# recurrence. See Prefill kernel selection below.
+# export VLLM_GDN_PREFILL=parallel     # or sequential; unset = grouped
 export VLLM_UNIFIED_KV_GATHER=1      # shared KV + GDN-state slab, .ap indirect gather
 export VLLM_QWEN_QKV_MATMUL=1        # QKV matmul fallback: the fused NKI QKV overruns SBUF at TP=4
 
@@ -381,11 +396,16 @@ driven against the server's OpenAI-compatible endpoint:
 | `exact_match` (strict-match) | **94.0%** | ±2.4 |
 | `exact_match` (flexible-extract) | **97.0%** | ±1.7 |
 
+Measured on the default `grouped` kernel **and** on `sequential`, with the same recipe: both score
+94.0 % / 97.0 %, so at short prompts this figure is not sensitive to the prefill kernel. (The stderr is
+the binomial `SE` at these rates and n=100, so it is the same for both.) Where the kernels *do* separate
+is long context — see [Accuracy at long context](#accuracy-at-long-context).
+
 Recipe: 100 questions, 4-shot with the chat template applied
 (`--apply_chat_template --fewshot_as_multiturn`), `max_tokens 448` and
 `enable_thinking: false` so prompt plus generation stays inside the 1024-token window,
-`max-model-len 1024`, `max-num-batched-tokens 512`, `--max-num-seqs 1`,
-and the default sequential GatedDeltaNet prefill. The ± figures are one binomial `SE` at n=100.
+`max-model-len 1024`, `max-num-batched-tokens 512`, `--max-num-seqs 1`. The ± figures are one
+binomial `SE` at n=100. Both prefill kernels measured are named in the paragraph above.
 
 The spread between the two filters is a formatting effect: strict-match requires the answer in
 the exact `The answer is X` form, and this model frequently answers correctly without it. Prefer
@@ -408,21 +428,37 @@ stay fp8-resident or are dequantised to bf16 at load. n=100, 4-shot, `max-model-
 
 Chunked prefill splits a prompt into `max-num-batched-tokens` pieces, and the 48 GatedDeltaNet layers
 carry a recurrent state across those boundaries (the 16 full-attention layers carry theirs in the KV
-cache). The table below is the same GSM8K recipe with ~25,000 tokens of content-free filler prepended,
-so the prompt spans ~50 prefill chunks instead of two:
+cache). The tables below are the same GSM8K recipe, once as measured above and once with ~25,000 tokens
+of content-free filler prepended. 4-shot, greedy, FP8, `max-num-batched-tokens 512`, `max-num-seqs 1`
+in every row.
 
-| Prompt | `max-model-len` | Filler | Prefill kernel | Prefix caching | strict | flex | n |
-|---|---|---|---|---|---|---|---|
-| short | 1024 | — | `sequential` | off | **0.940** | 0.970 | 100 |
-| long | 32768 | ~25,000 tok | `sequential` | off | **0.880** | 0.920 | 50 |
-| long | 32768 | ~25,000 tok | `parallel` | off | **0.900** | 0.933 | 30 |
-| long | 32768 | ~25,000 tok | `sequential` | on | 0.900 | 0.967 | 30 |
+**Short prompts** — the baseline, `max-model-len` 1024, no filler, prefix caching off:
 
-4-shot, greedy, FP8, `max-num-batched-tokens 512`, `max-num-seqs 1` at every row; one binomial `SE` is
-2.4 pt at n=100, 4.6 pt at n=50 and 6 pt at n=30. The long rows sit 4–6 pt below the short one, inside
-the error bars (1.2 `SE` on the short-vs-long difference). The claim the table supports is that a
-25,000-token irrelevant prefix costs at most a few points, on either prefill kernel and with or without
-prefix caching.
+| Prefill kernel | strict | flex | n |
+|---|:---:|:---:|:---:|
+| `sequential` | **0.940** | 0.970 | 100 |
+| `grouped` (default) | **0.940** | 0.970 | 100 |
+
+**Long prompts** — `max-model-len` 32768 with ~25,000 tokens of filler, so the prompt spans ~50 prefill
+chunks instead of two:
+
+| Prefill kernel | Prefix caching | strict | flex | n |
+|---|:---:|:---:|:---:|:---:|
+| `sequential` | off | **0.880** | 0.920 | 50 |
+| `sequential` | on | 0.900 | 0.967 | 30 |
+| `parallel` | off | **0.900** | 0.933 | 30 |
+| `grouped` (default) | off | **0.933** | 0.967 | 30 |
+
+One binomial `SE` is 2.4 pt at n=100, 4.6 pt at n=50 and 6 pt at n=30, so read the differences between
+long rows as inside the error bars.
+
+The default scores the same as `sequential` on short prompts, and **does not drop at long context**: its
+long row is within one `SE` of its own short row, and it is the highest of the long rows — above
+`parallel` by 3.3 pt and `sequential` by 5.3 pt, both within the bars at these `n`. So the claim this
+supports for `grouped` is "does not degrade", not that it is measurably better. `sequential`'s long rows
+sit 4–6 pt below its short one, also inside the bars (1.2 `SE` on the short-vs-long difference). Taken
+together: a 25,000-token irrelevant prefix costs at most a few points, on any of the three prefill
+kernels and with or without prefix caching.
 
 ### Logit validation (BF16 path)
 
@@ -440,8 +476,9 @@ by not using fp32.
 | `Qwen/Qwen3.8-27B` (BF16) | **0.9282** | 2 / 3 |
 | `Qwen/Qwen3.6-27B` (BF16) | **0.9448** | 3 / 3 |
 
-Both are inside the bf16 noise floor. Measured on the current code at TP=4, `max-model-len` 512,
-`kv_segment_size_buckets: [512]`, the default `sequential` prefill.
+Both are inside the bf16 noise floor. Measured at TP=4, `max-model-len` 512,
+`kv_segment_size_buckets: [512]`, on the `sequential` prefill kernel — this validation was **not** repeated
+on the current default, so read it as a statement about the BF16 weight path rather than about a kernel.
 
 > **On Qwen3.8's 2 / 3 — a tolerance artefact, not an accuracy problem.** The gate is a worst-**single-token**
 > peak against fixed TopK tolerances, so one token anywhere in the run can fail it while σ — an RMS over
@@ -458,34 +495,52 @@ Both are inside the bf16 noise floor. Measured on the current code at TP=4, `max
 
 ## Measured performance
 
-All figures from a single **trn2.3xlarge**, TP=4, `max-model-len` 4096,
-`max-num-batched-tokens` 512, `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.30`, greedy sampling,
-natural-text prompts (~200 words in, 128 tokens out). HBM is the sum over all four ranks as reported by
-`neuron-monitor`. TTFT is a **p50 over 24 requests** — see [How to read TTFT](#how-to-read-ttft) below,
-which matters at concurrency. **Prefix caching is off in every row**, matching the serve recipes above.
-Every table covers `max-num-seqs` 1 and 8.
+All figures from a single **trn2.3xlarge**, TP=4, `max-num-batched-tokens` 512,
+`VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.30`, greedy sampling, natural-text prompts, 128 output tokens
+(`max-model-len` is 4096 for the short-prompt table and 32768 for the long one). HBM is the sum over all
+four ranks as reported by `neuron-monitor`. TTFT is a **p50 over 24 requests** — see
+[How to read TTFT](#how-to-read-ttft) below, which matters at concurrency. **Prefix caching is off in
+every row**, matching the serve recipes above. Every table covers `max-num-seqs` 1 and 8.
 
-Both prefill kernels were measured on the same hardware with the same recipe, because the choice between
-them is a real performance trade — see
-[Prefill kernel selection](#prefill-kernel-selection-vllm_gdn_prefill).
+All three prefill kernels were measured on the same hardware with the same recipe, so the rows are
+directly comparable. Every number in this README comes from these two tables; the sections that follow
+interpret them.
 
-**Default — `sequential`** (FP8)
+**Short prompts** — ~200 words in (247 prompt tokens), 128 output tokens, `max-model-len` 4096:
 
-| `max-num-seqs` | HBM used (GB) | Output tok/s | TTFT p50 (ms) | Mean TPOT (ms) |
-|---|---|---|---|---|
-| 1 | **74.37** | **23.65** | 1315.9 | **32.19** |
-| 8 | **74.50** | **60.54** | 6604.1 | **85.52** |
+| `max-num-seqs` | Kernel | HBM used (GB) | Output tok/s | TTFT p50 (ms) | Mean TPOT (ms) |
+|---|---|:---:|:---:|:---:|:---:|
+| 1 | `sequential` | 74.37 | 23.58 | 1,317.5 | **32.23** |
+| 1 | `parallel` | 74.05 | 27.02 | 371.2 | 34.22 |
+| 1 | `grouped` (default) | 74.15 | **27.77** | **254.4** | 34.23 |
+| 8 | `sequential` | 74.50 | 60.20 | 6,610.6 | 85.59 |
+| 8 | `parallel` | 74.19 | 97.77 | 1,885.1 | 67.64 |
+| 8 | `grouped` (default) | 74.29 | **107.44** | **1,305.6** | 64.46 |
 
-**Opt-in — `VLLM_GDN_PREFILL=parallel`** (FP8)
+**Long prompts** — 6,319 prompt tokens, 128 output tokens, `max-model-len` 32768, output length pinned so
+every request emits all of them:
 
-| `max-num-seqs` | HBM used (GB) | Output tok/s | TTFT p50 (ms) | Mean TPOT (ms) |
-|---|---|---|---|---|
-| 1 | **74.05** | **27.07** | 369.6 | **34.22** |
-| 8 | **74.19** | **98.56** | 1880.2 | **67.56** |
+| `max-num-seqs` | Kernel | HBM used (GB) | Output tok/s | TTFT p50 (ms) | Mean TPOT (ms) |
+|---|---|:---:|:---:|:---:|:---:|
+| 1 | `sequential` | 77.96 | 5.26 | 19,375 | **37.50** |
+| 1 | `parallel` | 77.63 | 10.47 | 7,088 | 39.56 |
+| 1 | `grouped` (default) | 77.73 | **11.93** | **5,588** | 39.75 |
+| 8 | `sequential` | 78.43 | 6.13 | 96,836 | 628.67 |
+| 8 | `parallel` | 78.10 | 14.64 | 35,348 | 298.96 |
+| 8 | `grouped` (default) | 78.20 | **17.69** | **27,842** | **257.75** |
 
-**Batch scaling.** Going from `max-num-seqs` 1 to 8 multiplies output throughput by **2.56×** on
-`sequential` and **3.64×** on `parallel` — both sub-linear against the 8× in batch size, and the default
-scales less well for the prefill-stall reason below.
+At a fixed `max-num-seqs` the three kernels sit within 0.35 GB of each other, so the kernel choice is a
+latency and accuracy decision, not a memory one — see
+[Long context: memory and speed](#long-context-memory-and-speed) for the ranges and for how
+`max-model-len` itself moves HBM.
+
+**Batch scaling.** Going from `max-num-seqs` 1 to 8 multiplies output throughput by **3.87×** on
+`grouped`, **3.64×** on `parallel` and **2.56×** on `sequential` — all sub-linear against the 8× in batch
+size, and `sequential` scales least well for the prefill-stall reason below.
+
+> The initial release quoted 23.65 tok/s / 1,315.9 ms for `sequential` and 27.07 / 369.6 for `parallel` at
+> `max-num-seqs` 1. Those were re-measured on the same machine for the round above and reproduced to
+> within 0.4 %; the later values are used here so that all three kernels come from one round.
 
 ### How to read TTFT
 
@@ -501,41 +556,51 @@ The two concurrency regimes measure different things.
   first few met an idle server and the rest queued.
 
 So the concurrency > 1 rows are a queueing-inclusive latency, not a prefill cost. Compare TTFT between
-the two kernels only at equal concurrency.
+the kernels only at equal concurrency.
 
 **Why p50 and not the mean.** The first request after startup costs up to 1.9× the steady-state value
 (686 ms against a 369.6 ms p50 on `parallel`; 1512 ms against 1315.9 ms on `sequential`). Over only four
 requests that single cold sample moves the mean enough to matter: the same four arms measured that way
 read 7 % high at `max-num-seqs` 1, which is large enough to invent a regression that is not there.
 
-### Choosing between the two kernels
+### Choosing among the three kernels
 
-`sequential` is the default because it evaluates the recurrence definition directly, with no matrix
-inverse and no chunk-boundary reconstruction — the conservative choice for a path whose numerics are
-load-bearing. It pays **≈3.5× higher TTFT p50** at both concurrencies for that. TPOT moves in the other
-direction and then reverses:
+`grouped` is the default because it wins on both axes at once. **The speed comes from the algorithm**:
+batching eight chunks into one group packs their per-sub-block work onto the 128-partition axis, and
+splitting the intra-chunk solve keeps that packing possible — together 2.3× less kernel time than
+`parallel` and 13× less than `sequential` at the shipped shape. Accuracy then comes from running it in
+fp32, which is a requirement rather than a speed lever (see below). There is no trade to make between the
+two, which is why the earlier guidance ("keep the exact recurrence unless you need TTFT") no longer
+applies.
 
-| `max-num-seqs` | TPOT `sequential` | TPOT `parallel` | Output tok/s |
-|---|---|---|---|
-| 1 | **32.19** (6 % better) | 34.22 | 13 % lower |
-| 8 | 85.52 (27 % worse) | **67.56** | 39 % lower |
+Reading the two tables in [Measured performance](#measured-performance): against the default that shipped
+before (`sequential`), `grouped` gives **1.18–2.89× the output throughput** and **3.5–5.2× lower TTFT
+p50** across the four operating points there (short and long prompts, `max-num-seqs` 1 and 8).
 
-`VLLM_GDN_PREFILL` selects the **decode** implementation as well as the prefill one — the recurrent-state
-convention differs between the two forms, so they cannot be mixed. At `max-num-seqs` 1, with nothing else
-in flight, the TPOT column is therefore a direct comparison of those two decode paths, and the default's
-torch scan is the faster of the two by 6 %.
+**On the TPOT column of those tables.** At `max-num-seqs` 1, with nothing else in flight, TPOT is a direct comparison of
+the three decode paths, and they are within 6–7 % of each other — `sequential`'s scan is marginally the
+fastest per token. At `max-num-seqs` 8 TPOT also absorbs *other* requests' prefill time, because prefill
+runs batch-1 and is not mixed with decode in one batch, so each prefill stalls every decoding sequence;
+that is why the ordering follows TTFT there rather than the per-token decode cost. The two contributions
+(decode speed versus stall time) **were not measured separately**, so read the concurrency > 1 rows as
+end-to-end behaviour.
 
-At higher concurrency TPOT also absorbs *other* requests' prefill time, because prefill runs batch-1 and
-is not mixed with decode in one batch, so each prefill stalls every decoding sequence. That is the likely
-reason the ordering reverses and the gap grows with concurrency — but the two contributions (decode speed
-versus stall time) **were not measured separately**, so read the concurrency > 1 rows as end-to-end
-behaviour rather than as a statement about decode. HBM is essentially unaffected (+0.3 GB). Both TPOT
-columns reproduced across two independent measurement rounds to within 0.05 %, so these differences are
-not run-to-run noise.
+**These differences are not run-to-run noise.** The TPOT columns reproduced across two independent
+measurement rounds to within 0.05 % in the original release, and the long-prompt figures were re-measured
+here as well: `parallel` at `max-num-seqs` 1 came back 10.47 tok/s / 39.56 ms TPOT against 10.50 / 39.54
+a day earlier, and `grouped` reproduced three times within 1 %.
 
-Pick `parallel` when time-to-first-token or aggregate throughput at concurrency matters; keep the default
-when you want the exact recurrence. The two score the same on GSM8K within noise — see
-[Prefill kernel selection](#prefill-kernel-selection-vllm_gdn_prefill).
+> **Fix the output length when you compare these numbers.** Output tok/s and TPOT are only comparable
+> across kernels if every request emits the same number of tokens. The three kernels do not produce
+> identical text, so left to stop at EOS they generate different amounts, and a request that stops early
+> inflates the per-request `(e2e − TTFT) / (tokens − 1)` average. Measured here with the output length
+> pinned; without pinning, `grouped` at 6,319 tokens reads 9.4 tok/s and 45.9 ms TPOT instead of the 11.93
+> and 39.75 tabulated above, purely from that effect.
+
+**Working precision.** The chunked forms trade exactness for matmuls, and the default runs in **fp32** so
+that trade stays inside what this model's decode tolerates — which is why its GSM8K figures match
+`sequential`'s rather than sitting below them. That costs about 15 % more kernel time, and `grouped` is
+still 2.3× faster than `parallel` and 13× faster than `sequential` with it.
 
 ### FP8 vs BF16
 
@@ -544,7 +609,16 @@ when you want the exact recurrence. The two score the same on GSM8K within noise
 > holds the checkpoint and the serve configuration fixed so the only variable is MLP precision. The real
 > BF16 release is verified separately (see [Verification scope](#verification-scope)).
 
-On the default `sequential` kernel, both columns on the current code:
+> **This is a different "precision" from the prefill kernel's.** FP8-vs-BF16 here is the **MLP weight**
+> storage precision, which decides HBM footprint and how many weight bytes decode reads. The default
+> prefill kernel's fp32 working precision is the GatedDeltaNet **recurrence compute**, a separate
+> subsystem; the two do not interact.
+
+Measured on the `sequential` kernel, both columns on the same code. This comparison was **not** repeated
+on the current default. It isolates MLP precision with the kernel held fixed on both sides, so the
+FP8-vs-BF16 delta carries over — but the absolute figures are `sequential`'s, so read the columns as a
+difference, not as the latency a deployment on the default would see (its TTFT is in
+[Measured performance](#measured-performance)):
 
 | `max-num-seqs` | HBM FP8 / BF16 (GB) | Output tok/s FP8 / BF16 | TTFT p50 FP8 / BF16 (ms) |
 |---|---|---|---|
@@ -556,12 +630,12 @@ TTFT is unchanged, as expected for a change confined to the decode weight path. 
 the arithmetic — the MLP holds ≈17.1B of the 27B parameters, so bf16 ≈34.2 GB against fp8 ≈17.1 GB — and
 the speed-up is consistent with decode being byte-bound, since the fp8 kernel halves the weight bytes read
 on the hot path. That mechanism sits in the MLP and is independent of the prefill kernel, so it carries
-over to the opt-in kernel unchanged. FP8's throughput edge narrows as concurrency rises, as
+over to the other two kernels unchanged. FP8's throughput edge narrows as concurrency rises, as
 non-weight-read overheads grow relative to the halved weight traffic.
 
 ### What prefix caching costs
 
-Same configuration with `--enable-prefix-caching` added, on `sequential`:
+Same configuration with `--enable-prefix-caching` added, on `sequential` (not repeated on the default):
 
 | `max-num-seqs` | Output tok/s off / on | TTFT p50 off / on (ms) | HBM off / on (GB) |
 |---|---|---|---|
@@ -576,7 +650,10 @@ identical every time took 18 minutes with caching on against ~3 hours with it of
 
 ### Long context: memory and speed
 
-`max-num-seqs` 1, prefill chunk 512, `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.30`.
+`max-num-seqs` 1, prefill chunk 512, `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.30`. Measured on
+`sequential` in the original round; memory is kernel-independent to within 0.35 GB (see the note at the
+end of this section), so these figures stand for the default as well — the default reads 77.73 GB at
+`max-model-len` 32768 against the 77.96 GB below.
 
 | `max-model-len` | FP8 HBM (GB) | BF16 HBM (GB) |
 |---|---|---|
@@ -585,29 +662,26 @@ identical every time took 18 minutes with caching on against ~3 hours with it of
 
 Raising `max-model-len` from 1024 to 32768 costs **+3.6 GB** of HBM, because the KV pool is
 sized by the GMU budget fraction rather than by demand. **BF16 reaches 32K as well** — fp8 is not what
-makes long context possible here; what fp8 buys is headroom (**18.0 GB** free at 32K against 2.8 GB) and the throughput
-above. That headroom is what leaves room to raise the KV budget fraction or the batch size further.
+makes long context possible here; what fp8 buys is headroom (**18.0 GB** free at 32K against 2.8 GB) and the throughput in
+[Measured performance](#measured-performance). That headroom is what leaves room to raise the KV budget fraction or the batch size further.
 
-**Throughput and latency at 6,319 prompt tokens**, same recipe at `max-model-len` 32768, 128 output
-tokens, every request filling the budget:
+The per-kernel throughput and latency at 6,319 prompt tokens is in the long-prompt table in
+[Measured performance](#measured-performance); this section reads it against the short-prompt table to
+show what length alone costs, holding the kernel at the default.
 
-| `max-num-seqs` | HBM (GB) | Output tok/s | TTFT p50 (ms) | Mean TPOT (ms) |
-|---|---|---|---|---|
-| 1 | 77.96 | 5.30 | 19,354 | 37.45 |
-| 8 | 78.43 | 6.13 | 97,064 | 627.92 |
+Against the short-prompt figures, throughput falls to **0.43×** at `max-num-seqs` 1 and TTFT rises
+**22×**, which is what a 12× longer prompt costs in a prefill that is O(N²) in the full-attention layers.
+The TTFT ratio is the steeper of the two because the short-prompt baseline is now only 254 ms.
+**Concurrency barely helps at this length** — 11.93 → 17.69 tok/s (1.48×), against 3.87× on short prompts
+— because prefill runs batch-1 and is not mixed with decode, so eight 6,319-token prefills serialise and
+stall every decoding sequence. That is also why TPOT rises 6.5× from `max-num-seqs` 1 to 8 at this length
+(39.75 → 257.75 ms) while the per-token decode cost itself does not change. Size the batch for short prompts, not for long ones.
 
-Against the ~200-word figures above, throughput falls to 0.22× at `max-num-seqs` 1 and TTFT rises 14.7×,
-which is what a 12× longer prompt costs in a prefill that is O(N²) in the full-attention layers.
-**Concurrency barely helps at this length** — 5.30 → 6.13 tok/s, against 2.56× on short prompts — because
-prefill runs batch-1 and is not mixed with decode, so eight 6,319-token prefills serialise and stall every
-decoding sequence. That is also why TPOT rises 17× while the per-token decode cost itself does not change.
-Size the batch for short prompts, not for long ones.
-
-The opt-in `parallel` kernel was within 0.3 GB of the default at every length measured (71.90–74.64 GB
-across `max-model-len` 1024–16384), so the prefill kernel does not materially
-change the long-context memory profile — the trade between the two kernels is latency, not memory. Those
-figures predate the state-carry change; the comparison is a difference between kernels, which a uniform
-offset does not affect.
+**Memory is essentially kernel-independent**, so the `max-model-len` table above transfers to the other
+two kernels. At a fixed `max-num-seqs` the three sit within 0.35 GB of each other — 74.05–74.37 GB on
+short prompts and 77.63–77.96 GB on long ones at `max-num-seqs` 1 — and `parallel` stayed within 0.3 GB of
+`sequential` at every intermediate length measured (71.90–74.64 GB across `max-model-len` 1024–16384).
+What separates the kernels is latency and accuracy, not memory.
 
 ## Contents of this bundle
 
@@ -650,15 +724,16 @@ standalone)
 
 ```text
 vllm_neuron/functional/
-├── gated_delta_rule.py             # Chunked GDN prefill entry point (the opt-in VLLM_GDN_PREFILL=parallel kernel)
-├── gated_delta_rule_seq.py         # Sequential GDN prefill kernel (the default)
+├── gated_delta_rule.py             # Chunked GDN prefill entry point (VLLM_GDN_PREFILL=parallel)
+├── gated_delta_rule_seq.py         # Sequential GDN prefill kernel (VLLM_GDN_PREFILL=sequential)
 ├── gdn_conv_update.py              # Slot-indexed decode conv-state update, addressed by indirect DMA
 ├── gdn_state_update.py             # Slot-indexed decode recurrent-state update, addressed by indirect DMA
 ├── paged_kv_gather.py              # Paged prefix-KV gather for the shared unified KV slab
 └── linear_attention/
     ├── __init__.py
     ├── gated_delta_rule.py         # Chunked GDN prefill public API
-    ├── _gated_delta_rule_kernel.py # The NKI chunk kernel
+    ├── _gated_delta_rule_kernel.py # The NKI chunk kernel (parallel) and the decode single-step kernel
+    ├── _gated_delta_rule_grouped_kernel.py  # The NKI chunk-group prefill kernel (the default), fp32, carry-in state
     ├── causal_conv1d.py            # Short-conv public API
     └── _causal_conv1d_kernel.py    # The NKI short-conv kernel
 ```
@@ -700,3 +775,4 @@ docs/tutorials/index.md                   # Grid card + toctree entry (modified)
 docs/model-recipes/qwen3-8-27b.md         # Model recipe pointer to this README (new)
 docs/tutorials/tutorial-qwen3-8-27b.md    # Deployment tutorial pointer to this README (new)
 ```
+
