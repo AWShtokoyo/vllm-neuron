@@ -19,6 +19,12 @@ class LayerSpec:
     dtype: torch.dtype
     sliding_window_size: int | None = None
     chunk_size: int | None = None
+    # Multi-head Latent Attention: a single compressed latent buffer serves as
+    # both K and V (no separate value cache). When True, the runner emits an
+    # MLAAttentionSpec (half the page size of FullAttentionSpec, which budgets
+    # for K+V) and allocates one buffer that k_cache/v_cache alias, halving the
+    # per-layer KV HBM footprint.
+    is_mla: bool = False
 
 
 @dataclass

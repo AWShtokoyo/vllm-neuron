@@ -3,6 +3,6 @@ import importlib as _importlib
 
 
 def __getattr__(name):
-    if name in ("llama3", "gpt_oss"):
+    if name in ("llama3", "gpt_oss", "glm_5_2"):
         return _importlib.import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

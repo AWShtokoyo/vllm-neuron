@@ -129,6 +129,7 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16

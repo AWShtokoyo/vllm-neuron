@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -74,6 +75,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.mtp import MtpProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
@@ -736,6 +738,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        # MTP (Multi-Token Prediction) self-speculation — GLM-5.2 layer-78 head
+        # as a γ=1 draft.
+        self.is_mtp_spec = False
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -748,6 +753,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+                self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "mtp":
+                self.is_mtp_spec = True
+                self.drafter = MtpProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
@@ -1382,6 +1393,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise RuntimeError(
                     "Model does not support EAGLE3 interface but EAGLE3 spec decoding was requested"
                 )
+        elif self.is_mtp_spec:
+            # MTP needs a SINGLE pre-lm_head hidden (no 3x concat, no aux-layer
+            # tuple). The target model captures it and returns it as
+            # aux_hidden_states on the spec step.
+            self.model.set_mtp_hidden_state_capture(True)
 
         self._target_tensor_capture = None
         self._draft_tensor_capture = None
@@ -1774,6 +1790,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "prev_num_draft_tokens": prev_num_draft,
             "req_indices_per_token": req_indices_per_token,
         }
+
+    @property
+    def is_spec_decode(self) -> bool:
+        """True when any speculative-decode drafter is active (Eagle3 or MTP).
+
+        Used to unify the runner's spec-decode branch points so the MTP path
+        reuses the Eagle3 plumbing (aux-hidden capture, model-output unpack,
+        proposer dispatch) instead of duplicating each site.
+        """
+        return self.is_eagle3_spec or self.is_mtp_spec
 
     def _model_is_async_spec_decoded(self) -> bool:
         """Whether the model uses the ``@async_speculative_decoding``
@@ -4579,9 +4605,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
 
         # === Draft model graph capture ===
+        # Both Eagle3 and MTP run a prefill pass to seed the draft's KV during
+        # the target's prefill (MTP mirrors upstream vLLM, which proposes at the
+        # prefill step over the full prompt). The MTP draft's forward SP-shards
+        # its fused hidden before the reused Glm52DecoderLayer prefill path
+        # (glm_5_2/mtp.py), matching the base backbone's sharded-in/sharded-out
+        # contract.
         if self.drafter is not None:
             logger.info(
-                "Capturing EAGLE3 prefill graphs for bucket size: %d", bucket_size
+                "Capturing draft prefill graphs for bucket size: %d", bucket_size
             )
             self.drafter.graph_extract(
                 num_tokens=bucket_size,
@@ -4662,8 +4694,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         # === Draft model warmup ===
+        # Both Eagle3 and MTP warm a prefill bucket (see the graph_extract note
+        # above): the MTP draft prefills to seed its layer-78 KV over the prompt,
+        # SP-sharding its fused hidden to match the base decoder-layer contract.
         if self.drafter is not None:
-            logger.info("Warming up EAGLE3 for bucket size: %d", bucket_size)
+            logger.info("Warming up draft for bucket size: %d", bucket_size)
             self.drafter.warmup(
                 num_tokens=bucket_size,
                 num_reqs=1,
@@ -5897,8 +5932,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
 
         # If spec decode enabled, log acceptance stats and propose draft tokens.
-        # aux_hidden_states is None when eagle3 is not active.
-        if self.is_eagle3_spec and aux_hidden_states is not None:
+        # aux_hidden_states is None when spec decode (eagle3/mtp) is not active.
+        if self.is_spec_decode and aux_hidden_states is not None:
             max_position = positions.max().item() if positions.numel() > 0 else 0
             num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims
@@ -7169,15 +7204,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         last_accepted_token: torch.Tensor | None = None
 
         if self.on_device_sampling:
-            if self.is_eagle3_spec:
+            if self.is_spec_decode:
                 if spec_decode_metadata is not None:
-                    # Eagle3 + spec decode: model returns 4-tuple
+                    # Spec decode (eagle3/mtp): model returns 4-tuple
                     # (sampled_tokens, aux_hidden_states, gathered_logits,
                     #  last_accepted_token). The fourth element is emitted
                     # by the rejection sampler and is shape [bs] with
                     # default stride; consumers (spec→non-spec transition)
                     # use it as input_ids without slicing or stride
-                    # manipulation on a NEFF output.
+                    # manipulation on a NEFF output. For MTP the aux element
+                    # is a single [T, hidden] tensor (not [T, 3*hidden]); the
+                    # positional unpack is identical.
                     (
                         model_output_tensor,
                         aux_hidden_states,
@@ -7185,7 +7222,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         last_accepted_token,
                     ) = model_output
                 else:
-                    # Eagle3 non-spec: model returns 3-tuple
+                    # Spec decode non-spec step: model returns 3-tuple
                     # (sampled_tokens, aux_hidden_states, gathered_logits)
                     (
                         model_output_tensor,
@@ -8306,9 +8343,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        # TODO: now only supports EAGLE speculative decoding
-        # Add more when needed
-        assert isinstance(self.drafter, EagleProposer)
+        # Supports EAGLE3 and MTP (both mirror the EagleProposer public surface).
+        assert isinstance(self.drafter, (EagleProposer, MtpProposer))
 
         num_reqs = self.input_batch.num_reqs
 
@@ -8524,8 +8560,37 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
 
+            # MLA: a single compressed latent buffer is both K and V. Its
+            # page_size_bytes already omits the K+V factor of 2, so allocate one
+            # [num_blocks, num_kv_heads, block_size, head_size] buffer and bind
+            # it as both k_cache and v_cache (they alias the same storage). This
+            # halves KV HBM vs. the FullAttentionSpec (2, ...) layout. Checked
+            # before the FullAttentionSpec branch because MLAAttentionSpec is a
+            # subclass of it.
+            if isinstance(kv_cache_spec, MLAAttentionSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                    mla_shape = (
+                        num_blocks,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.head_size,
+                    )
+                    typed_tensor = _shared_dtype_view(
+                        raw_tensor, kv_cache_spec.dtype
+                    ).view(mla_shape)
+                    # k_cache and v_cache are the SAME latent buffer. The model
+                    # only reads k_cache; any v_cache write targets identical
+                    # storage (idempotent), so aliasing is safe.
+                    kv_caches[layer_name] = [typed_tensor, typed_tensor]
+                    self._kv_cache_full_tensors[layer_name] = typed_tensor
+
             # This is the case that all layers have the same kv_hidden_size.
-            if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
+            elif isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
@@ -8604,7 +8669,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.model.bind_kv_cache(kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, (EagleProposer, MtpProposer))
             # This binds the cache tensors to the draft model
             self.drafter.model.bind_kv_cache(kv_caches)
             # validate all draft model layers belong to the same kv cache group
@@ -8648,10 +8713,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            # MLA layers store a single compressed latent (no separate V), so
+            # emit MLAAttentionSpec: its page_size_bytes drops the K+V factor of
+            # 2 that FullAttentionSpec budgets, halving the KV HBM footprint (or,
+            # equivalently, doubling the block count for a fixed budget).
+            if getattr(layer, "is_mla", False):
+                spec = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=layer.num_kv_heads,
+                    head_size=layer.head_size,
+                    dtype=kv_cache_dtype,
+                )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
+            elif layer.sliding_window_size is None:
                 spec = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
@@ -8671,19 +8747,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             all_kv_cache_specs[layer_name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+            assert isinstance(self.drafter, (EagleProposer, MtpProposer))
 
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
-                all_kv_cache_specs[layer_name] = FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                    sliding_window=layer.sliding_window_size,
-                    attention_chunk_size=layer.chunk_size,
-                )
+                # An MLA draft layer (GLM-5.2 MTP layer 78) MUST emit
+                # MLAAttentionSpec — a FullAttentionSpec here would give the
+                # draft a K+V (factor-2) page size while the target MLA layers
+                # use single-latent pages, so MLAAttentionSpec.merge
+                # (kv_cache_interface.py) would see non-uniform grouping and
+                # initialize_kv_cache would raise. Mirror the target loop above.
+                if getattr(layer, "is_mla", False):
+                    all_kv_cache_specs[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=layer.num_kv_heads,
+                        head_size=layer.head_size,
+                        dtype=kv_cache_dtype,
+                    )
+                else:
+                    all_kv_cache_specs[layer_name] = FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=layer.num_kv_heads,
+                        head_size=layer.head_size,
+                        dtype=kv_cache_dtype,
+                        sliding_window=layer.sliding_window_size,
+                        attention_chunk_size=layer.chunk_size,
+                    )
 
         return all_kv_cache_specs
 

@@ -1276,6 +1276,14 @@ class NeuronWorker(WorkerBase):
             len(num_batched_tokens_buckets),
             len(num_seqs_buckets) if num_seqs_buckets else 0,
         )
+        # Post-warmup HBM probe: prints "Neuron HBM: X GiB used, Y GiB free"
+        # so we can diff against the pre-KV reading earlier in startup.
+        if not envs.VLLM_NEURON_CPU_MODE:
+            logger.info("Post-warmup HBM measurement:")
+            try:
+                self._query_runtime_memory_stats()
+            except RuntimeError as e:
+                logger.warning("Post-warmup HBM probe failed: %s", e)
         logger.info("=" * 80)
 
         STARTUP_TIME.labels(
@@ -1571,6 +1579,10 @@ class NeuronWorker(WorkerBase):
             # the fork pool only handled target-model jobs.
             if native_compile_only:
                 return
+            # Both Eagle3 and MTP extract a prefill draft graph: the MTP draft
+            # prefills to seed its layer-78 KV over the prompt (like upstream
+            # vLLM), SP-sharding its fused hidden to match the base decoder-layer
+            # contract (glm_5_2/mtp.py), so no is_mtp_spec gate is needed.
             has_drafter = self.model_runner.drafter is not None
             if has_drafter and not skip_prefill:
                 self._extract_prefill_drafter_graphs(prefill_buckets)
