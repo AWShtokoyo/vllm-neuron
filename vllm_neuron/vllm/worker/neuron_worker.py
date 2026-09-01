@@ -1582,7 +1582,7 @@ class NeuronWorker(WorkerBase):
             # Both Eagle3 and MTP extract a prefill draft graph: the MTP draft
             # prefills to seed its layer-78 KV over the prompt (like upstream
             # vLLM), SP-sharding its fused hidden to match the base decoder-layer
-            # contract (glm_5_2/mtp.py), so no is_mtp_spec gate is needed.
+            # contract (glm_moe_dsa/mtp.py), so no is_mtp_spec gate is needed.
             has_drafter = self.model_runner.drafter is not None
             if has_drafter and not skip_prefill:
                 self._extract_prefill_drafter_graphs(prefill_buckets)

@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GLM-5.2 BF16 Implementation
+GLM BF16 Implementation
 ====================================
 
-GLM-5.2 with Multi-head Latent Attention (MLA) and Mixture of Experts (MoE).
+GLM with Multi-head Latent Attention (MLA) and Mixture of Experts (MoE).
 
 Key architectural features:
 - MLA: compressed KV via low-rank projections + weight absorption
 - MoE: 256 routed experts (top-8) + 1 shared expert, with 3 dense layers
 - Standard RoPE (interleaved layout) on qk_rope_head_dim=64
 - DSA (DeepSeek Sparse Attention) indexer: implemented and opt-in via
-  `GLM52_DSA=1`. Default OFF, so the default forward path is full attention.
+  `VLLM_GLM_DSA=1`. Default OFF, so the default forward path is full attention.
   Enabling it widens a `full` layer's KV cache row, so it needs its own compile
 - BF16 checkpoint (no FP8 dequantization needed)
 
@@ -47,7 +47,7 @@ from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 import vllm_neuron.nn as neuron_nn
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
-from .config import Glm52Config
+from .config import GlmMoeDsaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ _Q_TILE = 128
 def dsa_enabled() -> bool:
     """Whether the DSA sparse-attention indexer participates in the forward path.
 
-    Default OFF, opt-in via `GLM52_DSA=1`, same convention (and same reason) as
-    `GLM52_MLA_BLOCK_KERNEL`: validated on CPU against the HuggingFace reference but
+    Default OFF, opt-in via `VLLM_GLM_DSA=1`, same convention (and same reason) as
+    `VLLM_GLM_MLA_BLOCK_KERNEL`: validated on CPU against the HuggingFace reference but
     not yet run on device, so it must not sit in front of requests. Read from the
     environment rather than `vllm_neuron/envs.py` to keep the shared-framework diff
     minimal, per ADD_MODEL_TO_FORK_INSTRUCTIONS.md §2c.
@@ -72,7 +72,7 @@ def dsa_enabled() -> bool:
     """
     import os
 
-    return os.environ.get("GLM52_DSA", "") in ("1", "true", "True")
+    return os.environ.get("VLLM_GLM_DSA", "") in ("1", "true", "True")
 
 
 def _dsa_segment_mask(
@@ -95,7 +95,7 @@ def _dsa_segment_mask(
 # =============================================================================
 
 
-class Glm52RMSNorm(nn.Module):
+class GlmMoeDsaRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
@@ -111,13 +111,13 @@ class Glm52RMSNorm(nn.Module):
 
 # =============================================================================
 # Section 2: Rotary Position Embedding (Standard, Interleaved)
-# GLM-5.2 uses default RoPE with rope_theta=8M, rope_interleave=true,
+# GLM uses default RoPE with rope_theta=8M, rope_interleave=true,
 # on qk_rope_head_dim=64 dimensions.
 # =============================================================================
 
 
-class Glm52RotaryEmbedding(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaRotaryEmbedding(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
         self.rope_theta = config.rope_theta
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -167,12 +167,12 @@ def _apply_rotary_emb_interleaved(
 # Same approach as DeepSeek-V3 MLA but with different dimensions:
 # q_lora_rank=2048, kv_lora_rank=512, qk_rope_head_dim=64,
 # qk_nope_head_dim=192, v_head_dim=256, num_heads=64
-# DSA indexer is opt-in (GLM52_DSA=1); default is full attention for all tokens.
+# DSA indexer is opt-in (VLLM_GLM_DSA=1); default is full attention for all tokens.
 # =============================================================================
 
 
-class Glm52Attention(nn.Module):
-    def __init__(self, config: Glm52Config, layer_idx: int):
+class GlmMoeDsaAttention(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.dtype = config.torch_dtype
@@ -210,11 +210,11 @@ class Glm52Attention(nn.Module):
         self.index_topk = config.index_topk
         types = config.indexer_types
         if not types:
-            # 🔴 Refuse rather than silently disable. `Glm52Config` defaults
+            # 🔴 Refuse rather than silently disable. `GlmMoeDsaConfig` defaults
             # `indexer_types` to None, and `from_configs` only fills it if the
             # checkpoint's config.json carries the key — so a variant checkpoint that
             # omits it would leave DSA requested-but-off, giving full attention with
-            # GLM52_DSA=1 set and nothing in the log to say so. That is the same
+            # VLLM_GLM_DSA=1 set and nothing in the log to say so. That is the same
             # silently-inert failure mode as the NKI kernel whose gate never opened.
             #
             # index_topk / index_head_dim / index_n_heads have the same exposure: they
@@ -223,9 +223,9 @@ class Glm52Attention(nn.Module):
             # meaningful when indexer_types is present, which this check requires.
             if dsa_enabled():
                 raise ValueError(
-                    "GLM52_DSA=1 but the model config carries no `indexer_types`, so "
+                    "VLLM_GLM_DSA=1 but the model config carries no `indexer_types`, so "
                     "there is no way to tell which layers own an indexer. Either the "
-                    "checkpoint's config.json omits the key, or Glm52Config.from_configs "
+                    "checkpoint's config.json omits the key, or GlmMoeDsaConfig.from_configs "
                     "filtered it out. Refusing to run full attention while DSA is asked "
                     "for."
                 )
@@ -272,9 +272,9 @@ class Glm52Attention(nn.Module):
 
         self.indexer = None
         if self.dsa_is_full:
-            from .dsa_indexer import Glm52DsaIndexer
+            from .dsa_indexer import GlmMoeDsaDsaIndexer
 
-            self.indexer = Glm52DsaIndexer(config, layer_idx)
+            self.indexer = GlmMoeDsaDsaIndexer(config, layer_idx)
 
         self.k_cache = None
         self.v_cache = None
@@ -283,7 +283,7 @@ class Glm52Attention(nn.Module):
         self.q_a_proj_weight = nn.Parameter(
             torch.empty(self.hidden_size_per_sp, self.q_lora_rank, dtype=self.dtype)
         )
-        self.q_a_layernorm = Glm52RMSNorm(
+        self.q_a_layernorm = GlmMoeDsaRMSNorm(
             self.q_lora_rank, config.rms_norm_eps, self.dtype
         )
         q_b_out_per_rank = self.num_heads_per_rank * self.q_head_dim
@@ -296,7 +296,7 @@ class Glm52Attention(nn.Module):
         self.kv_a_proj_weight = nn.Parameter(
             torch.empty(self.hidden_size_per_sp, kv_a_out, dtype=self.dtype)
         )
-        self.kv_a_layernorm = Glm52RMSNorm(
+        self.kv_a_layernorm = GlmMoeDsaRMSNorm(
             self.kv_lora_rank, config.rms_norm_eps, self.dtype
         )
 
@@ -406,9 +406,9 @@ class Glm52Attention(nn.Module):
         # int from the metadata, so this resolves at trace time, not per request.
         if self.dsa_enabled:
             raise NotImplementedError(
-                f"layers.{self.layer_idx}: GLM52_DSA=1 requires segmented prefill "
+                f"layers.{self.layer_idx}: VLLM_GLM_DSA=1 requires segmented prefill "
                 "(kv_segment_size > 0); the single-shot prefill path has no DSA "
-                "implementation. Set kv_segment_size_buckets, or unset GLM52_DSA."
+                "implementation. Set kv_segment_size_buckets, or unset VLLM_GLM_DSA."
             )
         return self.forward_prefill(
             hidden_states, positions, position_embeddings, attn_metadata,
@@ -996,7 +996,7 @@ class Glm52Attention(nn.Module):
             # 🔴 Must be <= 128, not Sq. The NKI inner block puts the query axis on
             # partitions and `_shape_ok` rejects Sq > 128, so passing Sq here left
             # `can_use_block_kernel` returning False at every real segment size —
-            # the opt-in kernel was unreachable even with GLM52_MLA_BLOCK_KERNEL=1.
+            # the opt-in kernel was unreachable even with VLLM_GLM_MLA_BLOCK_KERNEL=1.
             # Measured with the gate instrumented: q_tile=Sq consulted it once at
             # Sq=256 and opened 0 times; q_tile=128 opened 2 of 2. Query tiling is
             # exact (each row's softmax is independent of the others), so this
@@ -1322,8 +1322,8 @@ class Glm52Attention(nn.Module):
 # =============================================================================
 
 
-class Glm52DenseMLP(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaDenseMLP(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
 
         self.tp_group = get_tp_group()
@@ -1385,8 +1385,8 @@ class Glm52DenseMLP(nn.Module):
 # =============================================================================
 
 
-class Glm52SharedExpertMLP(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaSharedExpertMLP(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
 
         self.tp_group = get_tp_group()
@@ -1434,7 +1434,7 @@ class Glm52SharedExpertMLP(nn.Module):
 
 # =============================================================================
 # Section 4c: MoE Layer (256 routed experts + 1 shared expert)
-# GLM-5.2 uses sigmoid scoring with n_group=1 (simplified: no group-limited
+# GLM uses sigmoid scoring with n_group=1 (simplified: no group-limited
 # selection needed), e_score_correction_bias, and routed_scaling_factor.
 # =============================================================================
 
@@ -1463,13 +1463,13 @@ def _moe_expert_weight_loader(
 
 
 
-class Glm52MoE(nn.Module):
+class GlmMoeDsaMoE(nn.Module):
     """Mixture of Experts: 256 routed + 1 shared.
 
     With n_group=1, routing simplifies to standard sigmoid + top-k.
     """
 
-    def __init__(self, config: Glm52Config):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
 
         self.ep_degree = get_neuron_ep_degree()
@@ -1517,7 +1517,7 @@ class Glm52MoE(nn.Module):
             torch.empty(self.num_local_experts, self.intermediate_size_per_rank, self.hidden_size, dtype=self.dtype)
         )
 
-        self.shared_expert = Glm52SharedExpertMLP(config)
+        self.shared_expert = GlmMoeDsaSharedExpertMLP(config)
 
         self._setup_weight_loaders(config)
 
@@ -1717,24 +1717,24 @@ class Glm52MoE(nn.Module):
 # =============================================================================
 
 
-class Glm52DecoderLayer(nn.Module):
-    def __init__(self, config: Glm52Config, layer_idx: int):
+class GlmMoeDsaDecoderLayer(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_dense_layer = layer_idx < config.first_k_dense_replace
 
-        self.input_layernorm = Glm52RMSNorm(
+        self.input_layernorm = GlmMoeDsaRMSNorm(
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
-        self.post_attention_layernorm = Glm52RMSNorm(
+        self.post_attention_layernorm = GlmMoeDsaRMSNorm(
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
-        self.self_attn = Glm52Attention(config, layer_idx=layer_idx)
+        self.self_attn = GlmMoeDsaAttention(config, layer_idx=layer_idx)
 
         if self.is_dense_layer:
-            self.mlp = Glm52DenseMLP(config)
+            self.mlp = GlmMoeDsaDenseMLP(config)
         else:
-            self.mlp = Glm52MoE(config)
+            self.mlp = GlmMoeDsaMoE(config)
 
     def _is_decode(self, attn_metadata) -> bool:
         layer_name = f"layers.{self.layer_idx}.self_attn"
@@ -1776,8 +1776,8 @@ class Glm52DecoderLayer(nn.Module):
 # =============================================================================
 
 
-class Glm52Model(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaModel(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
         self.config = config
 
@@ -1793,15 +1793,15 @@ class Glm52Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                Glm52DecoderLayer(config, layer_idx)
+                GlmMoeDsaDecoderLayer(config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
 
-        self.norm = Glm52RMSNorm(
+        self.norm = GlmMoeDsaRMSNorm(
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
-        self.rotary_emb = Glm52RotaryEmbedding(config)
+        self.rotary_emb = GlmMoeDsaRotaryEmbedding(config)
 
         # MTP: when True, forward also returns the pre-`model.norm` hidden
         # (the layer-77 residual output) for the layer-78 draft head (D3 default).
@@ -1876,11 +1876,11 @@ class Glm52Model(nn.Module):
 
 
 @async_speculative_decoding
-class Glm52ForCausalLM(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaForCausalLM(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
         self.config = config
-        self.model = Glm52Model(config)
+        self.model = GlmMoeDsaModel(config)
 
         # MTP self-speculation: when True, the spec-decode forward captures the
         # single pre-lm_head hidden state and returns it (as aux_hidden_states)
@@ -2044,7 +2044,7 @@ class Glm52ForCausalLM(nn.Module):
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
-        config = Glm52Config.from_configs(hf_config, neuron_config)
+        config = GlmMoeDsaConfig.from_configs(hf_config, neuron_config)
         return cls(config)
 
     # -- KV Cache Management --
@@ -2086,7 +2086,7 @@ class Glm52ForCausalLM(nn.Module):
         """Load BF16 weights from checkpoint.
 
         DSA indexer weights are mapped only on `full` layers and only when DSA is
-        enabled, because that is when `Glm52Attention` constructs the module. With DSA
+        enabled, because that is when `GlmMoeDsaAttention` constructs the module. With DSA
         off the indexer tensors are present in the checkpoint and deliberately
         unmapped, which the loader reports as unexpected keys.
         """

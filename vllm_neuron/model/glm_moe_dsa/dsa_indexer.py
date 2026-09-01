@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.2 DSA (DeepSeek Sparse Attention) indexer — top-k key selection.
+"""GLM DSA (DeepSeek Sparse Attention) indexer — top-k key selection.
 
 The checkpoint ships a lightweight indexer alongside MLA whose only job is to pick,
 for each query, the `index_topk` keys worth attending to. With `index_topk=2048` the
@@ -8,7 +8,7 @@ attention term stops growing past that point.
 
 Reference: `transformers.models.glm_moe_dsa.modeling_glm_moe_dsa.GlmMoeDsaIndexer`.
 This is a re-implementation for the Neuron traced path, validated against that
-reference on CPU (`equiv_glm_5_2/tests/test_07_dsa_indexer.py`) before any device
+reference on CPU (`equiv_glm_moe_dsa/tests/test_07_dsa_indexer.py`) before any device
 compile, because a compile is the expensive step in this project.
 
 FOUR DETAILS THAT A RE-IMPLEMENTATION GETS WRONG IF NOT READ CAREFULLY. Each is
@@ -20,7 +20,7 @@ pinned by a test:
    `T > index_topk`.
 2. **`k_norm` is a LayerNorm with bias**, not the RMSNorm used everywhere else in
    this model. The checkpoint carries `indexer.k_norm.bias` as a separate tensor.
-3. **RoPE here is interleaved**, like the rest of GLM-5.2 but unlike DeepSeek-V3.2,
+3. **RoPE here is interleaved**, like the rest of GLM but unlike DeepSeek-V3.2,
    and it applies to the first `qk_rope_head_dim` of the indexer head, whose width
    (`index_head_dim=128`) is unrelated to the MLA head dims.
 4. **`shared` layers own no weights.** `indexer_types[i]` is `"full"` or `"shared"`;
@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config import Glm52Config
+from .config import GlmMoeDsaConfig
 
 # Matches the sentinel the tiled MLA path uses: exp() of this underflows to 0, so a
 # masked position contributes nothing without producing the NaN a true -inf would.
@@ -69,7 +69,7 @@ def _apply_rope_interleaved_pairs(x: torch.Tensor, cos: torch.Tensor, sin: torch
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
-class Glm52DsaIndexer(nn.Module):
+class GlmMoeDsaDsaIndexer(nn.Module):
     """Top-k key selection for one `"full"` layer.
 
     Weights are replicated per rank rather than sharded: the whole module is
@@ -78,7 +78,7 @@ class Glm52DsaIndexer(nn.Module):
     the selection path.
     """
 
-    def __init__(self, config: Glm52Config, layer_idx: int):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.dtype = config.torch_dtype

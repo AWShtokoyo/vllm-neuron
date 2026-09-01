@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GLM-5.2 FP8 Forward Dequant — ROW quantization mode.
+GLM FP8 Forward Dequant — ROW quantization mode.
 
 Store FP8 weights + per-row (per-output-channel) scales on HBM. Forward uses
 NF.mlp with quantization_type=ROW which handles dequant inside the kernel —
@@ -40,12 +40,12 @@ from vllm_neuron.parallel.neuron_parallel_state import (
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
-from .config import Glm52Config
+from .config import GlmMoeDsaConfig
 from .model import (
-    Glm52ForCausalLM as Glm52ForCausalLMBF16,
-    Glm52MoE as BF16MoELayer,
-    Glm52DenseMLP as BF16DenseMLP,
-    Glm52SharedExpertMLP as BF16SharedExpertMLP,
+    GlmMoeDsaForCausalLM as GlmMoeDsaForCausalLMBF16,
+    GlmMoeDsaMoE as BF16MoELayer,
+    GlmMoeDsaDenseMLP as BF16DenseMLP,
+    GlmMoeDsaSharedExpertMLP as BF16SharedExpertMLP,
     get_tp_group,
 )
 
@@ -190,8 +190,8 @@ def _fp8_row_moe_weight_loader(num_experts, shard_dim, shard_size, num_shards):
 # =============================================================================
 
 
-class Glm52DenseMLPFP8Fwd(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaDenseMLPFP8Fwd(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
 
         self.tp_group = get_tp_group()
@@ -265,8 +265,8 @@ class Glm52DenseMLPFP8Fwd(nn.Module):
 # =============================================================================
 
 
-class Glm52SharedExpertMLPFP8Fwd(nn.Module):
-    def __init__(self, config: Glm52Config):
+class GlmMoeDsaSharedExpertMLPFP8Fwd(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
         super().__init__()
 
         self.tp_group = get_tp_group()
@@ -334,12 +334,12 @@ class Glm52SharedExpertMLPFP8Fwd(nn.Module):
 # =============================================================================
 
 
-class Glm52MoELayerFP8Fwd(BF16MoELayer):
+class GlmMoeDsaMoELayerFP8Fwd(BF16MoELayer):
     """MoE with FP8 expert weights + per-row scales.
     Prefill: transient dequant → moe_cte (BF16).
     Decode: transient dequant → matmul loop."""
 
-    def __init__(self, config: Glm52Config):
+    def __init__(self, config: GlmMoeDsaConfig):
         nn.Module.__init__(self)
 
         self.ep_degree = get_neuron_ep_degree()
@@ -416,7 +416,7 @@ class Glm52MoELayerFP8Fwd(BF16MoELayer):
         )
 
         # Shared expert (FP8 ROW)
-        self.shared_expert = Glm52SharedExpertMLPFP8Fwd(config)
+        self.shared_expert = GlmMoeDsaSharedExpertMLPFP8Fwd(config)
 
     def _prepare_tkg_weights(self):
         """Reshape weights for moe_tkg kernel: stack gate+up into [E_L, H, 2, I].
@@ -449,7 +449,7 @@ class Glm52MoELayerFP8Fwd(BF16MoELayer):
     def _forward_decode_einsum(self, hidden_states_2d: torch.Tensor) -> torch.Tensor:
         """Kernel-free FP8 decode MoE: transient dequant → BF16 einsum.
 
-        Mirrors the BF16 ``Glm52MoE._forward_decode`` (model.py) exactly, but
+        Mirrors the BF16 ``GlmMoeDsaMoE._forward_decode`` (model.py) exactly, but
         dequantizes the FP8 stacked weights first (same per-row dequant as
         ``_forward_prefill``). Used by the MTP draft (``use_einsum_decode=True``)
         to AVOID the ``moe_tkg`` NKI kernel, whose internal indirect DMA goes
@@ -486,7 +486,7 @@ class Glm52MoELayerFP8Fwd(BF16MoELayer):
         up_bf16 = up_w.to(torch.bfloat16) * up_scale.unsqueeze(1)
         down_bf16 = self.down_proj_weights.to(torch.bfloat16) * self._tkg_down_scale.unsqueeze(1)
 
-        # Batched einsum over local experts (matches BF16 Glm52MoE._forward_decode).
+        # Batched einsum over local experts (matches BF16 GlmMoeDsaMoE._forward_decode).
         gate = torch.einsum("th,ehi->eti", hidden_states_2d, gate_bf16)
         up = torch.einsum("th,ehi->eti", hidden_states_2d, up_bf16)
         intermediate = F.silu(gate) * up
@@ -626,8 +626,8 @@ class Glm52MoELayerFP8Fwd(BF16MoELayer):
 # =============================================================================
 
 
-class Glm52ForCausalLM(Glm52ForCausalLMBF16):
-    """GLM-5.2 with FP8 ROW quantization (per-row weight scales, no activation scales)."""
+class GlmMoeDsaForCausalLM(GlmMoeDsaForCausalLMBF16):
+    """GLM with FP8 ROW quantization (per-row weight scales, no activation scales)."""
 
     def load_weights(self, checkpoint_path, device, cache_dir=None):
         tp_rank = self.sp_group.rank_in_group
@@ -911,18 +911,18 @@ class Glm52ForCausalLM(Glm52ForCausalLMBF16):
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
-        config = Glm52Config.from_configs(hf_config, neuron_config)
-        import vllm_neuron.model.glm_5_2.model as model_mod
-        orig_dense = model_mod.Glm52DenseMLP
-        orig_shared = model_mod.Glm52SharedExpertMLP
-        orig_moe = model_mod.Glm52MoE
-        model_mod.Glm52DenseMLP = Glm52DenseMLPFP8Fwd
-        model_mod.Glm52SharedExpertMLP = Glm52SharedExpertMLPFP8Fwd
-        model_mod.Glm52MoE = Glm52MoELayerFP8Fwd
+        config = GlmMoeDsaConfig.from_configs(hf_config, neuron_config)
+        import vllm_neuron.model.glm_moe_dsa.model as model_mod
+        orig_dense = model_mod.GlmMoeDsaDenseMLP
+        orig_shared = model_mod.GlmMoeDsaSharedExpertMLP
+        orig_moe = model_mod.GlmMoeDsaMoE
+        model_mod.GlmMoeDsaDenseMLP = GlmMoeDsaDenseMLPFP8Fwd
+        model_mod.GlmMoeDsaSharedExpertMLP = GlmMoeDsaSharedExpertMLPFP8Fwd
+        model_mod.GlmMoeDsaMoE = GlmMoeDsaMoELayerFP8Fwd
         try:
             model = cls(config)
         finally:
-            model_mod.Glm52DenseMLP = orig_dense
-            model_mod.Glm52SharedExpertMLP = orig_shared
-            model_mod.Glm52MoE = orig_moe
+            model_mod.GlmMoeDsaDenseMLP = orig_dense
+            model_mod.GlmMoeDsaSharedExpertMLP = orig_shared
+            model_mod.GlmMoeDsaMoE = orig_moe
         return model

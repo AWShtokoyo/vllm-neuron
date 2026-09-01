@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.2 MTP (Multi-Token Prediction) draft head — layer 78.
+"""GLM MTP (Multi-Token Prediction) draft head — layer 78.
 
-GLM-5.2 ships a native MTP head at checkpoint layer 78: a FULL MLA+MoE decoder
+GLM ships a native MTP head at checkpoint layer 78: a FULL MLA+MoE decoder
 layer wrapped by a fusion front-end (enorm/hnorm/eh_proj) and a shared output
 head (shared_head.norm), reusing the base `embed_tokens` and (untied) `lm_head`.
 Used here as a γ=1 self-speculative draft: predict token t+1 from the accepted
@@ -11,7 +11,7 @@ Draft forward (one propose step):
 
     emb   = embed_tokens(x_t)                                  # base shared embedding
     fused = eh_proj( cat([ enorm(emb), hnorm(h_t) ], dim=-1) ) # emb FIRST (D1), [.,12288]->[.,6144]
-    hid   = Glm52DecoderLayer@78(fused)                        # MLA + MoE (own KV), residuals internal (D7)
+    hid   = GlmMoeDsaDecoderLayer@78(fused)                        # MLA + MoE (own KV), residuals internal (D7)
     out   = shared_head.norm(hid)                              # final norm (D5, distinct tensor)
     logits= lm_head(out)                                       # base untied lm_head (D6)
     draft = argmax(logits)                                     # greedy (reuse eagle3 helper)
@@ -24,7 +24,7 @@ Design decisions (RESOLVED):
   D4 eh_proj replicated per rank (BF16, no shard, no scale) — 151MB, negligible vs ~10GB draft.
   D5 shared_head.norm is a SEPARATE tensor from decoder.post_attention_layernorm.
   D6 reuse base lm_head (no shared_head.head in checkpoint; tie_word_embeddings=False).
-  D7 Glm52DecoderLayer applies both residual adds internally — feed `fused` directly.
+  D7 GlmMoeDsaDecoderLayer applies both residual adds internally — feed `fused` directly.
 
 The DSA indexer (`self_attn.indexer.*`) IS present in the layer-78 checkpoint but is
 SKIPPED in this port (full attention; a no-op at ctx ≤ 2048).
@@ -49,12 +49,12 @@ from vllm_neuron.parallel.neuron_parallel_state import (
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
 
-# Reuse the base GLM-5.2 building blocks verbatim (layer-idx-parameterized).
-from .config import Glm52Config
+# Reuse the base GLM building blocks verbatim (layer-idx-parameterized).
+from .config import GlmMoeDsaConfig
 from .model import (
-    Glm52DecoderLayer,
-    Glm52RMSNorm,
-    Glm52RotaryEmbedding,
+    GlmMoeDsaDecoderLayer,
+    GlmMoeDsaRMSNorm,
+    GlmMoeDsaRotaryEmbedding,
 )
 # Reuse the greedy sampler + accepted-token extraction from Eagle3 (model-agnostic).
 from ..llama3.eagle3_model import extract_accepted_tokens
@@ -64,16 +64,16 @@ logger = logging.getLogger(__name__)
 MTP_LAYER_IDX = 78  # config.num_hidden_layers == 78 → the MTP head is checkpoint layer 78
 
 
-class Glm52MtpLayer(nn.Module):
-    """Fusion front-end + decoder-78 + final norm for the GLM-5.2 MTP head.
+class GlmMoeDsaMtpLayer(nn.Module):
+    """Fusion front-end + decoder-78 + final norm for the GLM MTP head.
 
-    Wraps a standard `Glm52DecoderLayer` (reused verbatim at layer_idx=78) with:
+    Wraps a standard `GlmMoeDsaDecoderLayer` (reused verbatim at layer_idx=78) with:
       * enorm / hnorm  — RMSNorms over the token embedding and target hidden (D2)
       * eh_proj        — replicated Linear(2*hidden, hidden) fusing the concat (D1/D4)
       * shared_head_norm — the final pre-lm_head RMSNorm (D5, separate tensor)
     """
 
-    def __init__(self, config: Glm52Config, layer_idx: int = MTP_LAYER_IDX):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int = MTP_LAYER_IDX):
         super().__init__()
         self.layer_idx = layer_idx
         hidden = config.hidden_size
@@ -81,16 +81,16 @@ class Glm52MtpLayer(nn.Module):
         dtype = config.torch_dtype
 
         # Fusion front-end (D1/D2/D4). enorm/hnorm replicated; eh_proj replicated BF16.
-        self.enorm = Glm52RMSNorm(hidden, eps, dtype)
-        self.hnorm = Glm52RMSNorm(hidden, eps, dtype)
+        self.enorm = GlmMoeDsaRMSNorm(hidden, eps, dtype)
+        self.hnorm = GlmMoeDsaRMSNorm(hidden, eps, dtype)
         self.eh_proj = nn.Linear(2 * hidden, hidden, bias=False, dtype=dtype)
 
         # The decoder body — MLA self-attn (own KV cache) + MoE (256 experts + shared).
-        # layer_idx=78 >= first_k_dense_replace=3 ⇒ Glm52DecoderLayer builds a MoE layer.
-        self.decoder = Glm52DecoderLayer(config, layer_idx=layer_idx)
+        # layer_idx=78 >= first_k_dense_replace=3 ⇒ GlmMoeDsaDecoderLayer builds a MoE layer.
+        self.decoder = GlmMoeDsaDecoderLayer(config, layer_idx=layer_idx)
 
         # Final norm applied to the decoder output before lm_head (D5).
-        self.shared_head_norm = Glm52RMSNorm(hidden, eps, dtype)
+        self.shared_head_norm = GlmMoeDsaRMSNorm(hidden, eps, dtype)
 
     def fuse(self, emb: torch.Tensor, h_t: torch.Tensor,
              positions: torch.Tensor | None = None) -> torch.Tensor:
@@ -115,7 +115,7 @@ class Glm52MtpLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: object | None,
     ) -> torch.Tensor:
-        # Glm52DecoderLayer handles both residual adds internally (D7).
+        # GlmMoeDsaDecoderLayer handles both residual adds internally (D7).
         return self.decoder(
             fused,
             positions=positions,
@@ -124,8 +124,8 @@ class Glm52MtpLayer(nn.Module):
         )
 
 
-class Glm52MtpForCausalLM(nn.Module):
-    """GLM-5.2 γ=1 MTP draft head.
+class GlmMoeDsaMtpForCausalLM(nn.Module):
+    """GLM γ=1 MTP draft head.
 
     Public surface mirrors `Eagle3LlamaForCausalLM` so `MtpProposer` (which mirrors
     `EagleProposer`) can drive it: `forward`, `from_configs`, `load_weights`,
@@ -133,7 +133,7 @@ class Glm52MtpForCausalLM(nn.Module):
     NO 3× aux concat, NO combine/fc layer, and NO recurrent loop (γ=1 ⇒ single pass).
     """
 
-    def __init__(self, config: Glm52Config, start_layer_idx: int = MTP_LAYER_IDX):
+    def __init__(self, config: GlmMoeDsaConfig, start_layer_idx: int = MTP_LAYER_IDX):
         super().__init__()
         self.config = config
         self.start_layer_idx = start_layer_idx
@@ -178,10 +178,10 @@ class Glm52MtpForCausalLM(nn.Module):
         )
 
         # The MTP layer (fusion + decoder-78 + shared_head.norm).
-        self.mtp = Glm52MtpLayer(config, layer_idx=start_layer_idx)
+        self.mtp = GlmMoeDsaMtpLayer(config, layer_idx=start_layer_idx)
 
         # RoPE — same construction as the base backbone.
-        self.rotary_emb = Glm52RotaryEmbedding(config)
+        self.rotary_emb = GlmMoeDsaRotaryEmbedding(config)
 
         # Base untied lm_head. Same ColumnParallel layout as the target.
         # Structural fix (draft only): GATHER the draft's logits to full vocab
@@ -300,10 +300,10 @@ class Glm52MtpForCausalLM(nn.Module):
             positions, device=fused.device, dtype=fused.dtype
         )
 
-        # SP-sharding contract for the reused Glm52DecoderLayer.
+        # SP-sharding contract for the reused GlmMoeDsaDecoderLayer.
         # The base backbone's PREFILL path expects hidden to arrive SP-SHARDED
         # (T/sp per rank): the target's model.forward reduce-scatters it via
-        # embed_tokens(scatter_tokens=True), and Glm52Attention.forward_prefill
+        # embed_tokens(scatter_tokens=True), and GlmMoeDsaAttention.forward_prefill
         # then ALL-GATHERs it back to full T (model.py:262-263) so q_len matches
         # the full-T cos/sin. Its output is reduce-scattered back to sharded, and
         # the residual add needs a sharded residual. The DECODE path takes full-T
@@ -325,7 +325,7 @@ class Glm52MtpForCausalLM(nn.Module):
         if is_prefill and sp > 1:
             T = fused.shape[0]
             # 🔴 The divisibility this slice needs is enforced in a DIFFERENT class.
-            # `Glm52ForCausalLM.forward` rejects `T % sp_world_size != 0` for the target,
+            # `GlmMoeDsaForCausalLM.forward` rejects `T % sp_world_size != 0` for the target,
             # and the draft inherits a valid T only because `extract_accepted_tokens`
             # SCATTERS into input_ids rather than resizing it. That coupling is invisible
             # from here: if it ever breaks, `T // sp` silently drops the remainder, the
@@ -441,7 +441,7 @@ class Glm52MtpForCausalLM(nn.Module):
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
     ) -> None:
         raise NotImplementedError(
-            "Glm52MtpForCausalLM.load_weights is provided by the FP8 subclass "
+            "GlmMoeDsaMtpForCausalLM.load_weights is provided by the FP8 subclass "
             "(model_fp8_per_channel path). The BF16 base head is CPU-reference only."
         )
 
@@ -452,15 +452,15 @@ class Glm52MtpForCausalLM(nn.Module):
         start_layer_idx: int = MTP_LAYER_IDX,
         neuron_config: NeuronConfig | None = None,
     ):
-        config = Glm52Config.from_configs(hf_config, neuron_config)
+        config = GlmMoeDsaConfig.from_configs(hf_config, neuron_config)
         return cls(config, start_layer_idx=start_layer_idx)
 
 
-class Glm52MtpForCausalLMFactory(nn.Module):
-    """Registry entry for the GLM-5.2 MTP draft head.
+class GlmMoeDsaMtpForCausalLMFactory(nn.Module):
+    """Registry entry for the GLM MTP draft head.
 
     Selects BF16 vs FP8-ROW (`fp8_per_channel`) based on `neuron_config.quantization`,
-    mirroring `glm_5_2/factory.py`. `MtpProposer.compile_and_load_draft_model`
+    mirroring `glm_moe_dsa/factory.py`. `MtpProposer.compile_and_load_draft_model`
     resolves the draft architecture name to this class and calls `from_configs`.
     """
 
@@ -473,12 +473,12 @@ class Glm52MtpForCausalLMFactory(nn.Module):
     ) -> nn.Module:
         quantization = neuron_config.quantization if neuron_config else None
         if quantization == "fp8_per_channel":
-            from .mtp_fp8 import Glm52MtpForCausalLM as Model
+            from .mtp_fp8 import GlmMoeDsaMtpForCausalLM as Model
         elif quantization in (None, "bf16"):
-            Model = Glm52MtpForCausalLM
+            Model = GlmMoeDsaMtpForCausalLM
         else:
             raise ValueError(
-                f"quantization='{quantization}' is not supported for the GLM-5.2 MTP "
+                f"quantization='{quantization}' is not supported for the GlmMoeDsa MTP "
                 "draft head. Supported: 'fp8_per_channel' or None/bf16."
             )
         return Model.from_configs(

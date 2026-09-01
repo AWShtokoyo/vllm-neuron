@@ -6,8 +6,8 @@ from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM
 from .qwen3_vl import Qwen3VLForConditionalGeneration
-from .glm_5_2 import Glm52ForCausalLM
-from .glm_5_2.mtp import Glm52MtpForCausalLMFactory
+from .glm_moe_dsa import GlmMoeDsaForCausalLM
+from .glm_moe_dsa.mtp import GlmMoeDsaMtpForCausalLMFactory
 
 
 def get_models() -> list[tuple[str, type]]:
@@ -25,12 +25,12 @@ def get_models() -> list[tuple[str, type]]:
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
-        ("GlmMoeDsaForCausalLM", Glm52ForCausalLM),
-        # GLM-5.2 layer-78 MTP self-speculative draft head. MtpProposer hard-sets
+        ("GlmMoeDsaForCausalLM", GlmMoeDsaForCausalLM),
+        # GLM layer-78 MTP self-speculative draft head. MtpProposer hard-sets
         # the draft arch to this name (vLLM's hf_config_override rewrites the raw
         # glm_moe_dsa draft arch to DeepSeekMTPModel). Speculative decoding is not
-        # a supported configuration for this port yet -- see GLM-5.2/README.md.
-        ("Glm52MtpForCausalLM", Glm52MtpForCausalLMFactory),
+        # a supported configuration for this port yet -- see GLM-5.3/README.md.
+        ("GlmMoeDsaMtpForCausalLM", GlmMoeDsaMtpForCausalLMFactory),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Weight loaders for GLM-5.2 FP8 checkpoint format.
+"""Weight loaders for GLM FP8 checkpoint format.
 
-GLM-5.2 FP8 checkpoints use block-wise quantization (128×128 blocks):
+GLM FP8 checkpoints use block-wise quantization (128×128 blocks):
   - weights stored as float8_e4m3fn
   - weight_scale_inv: [ceil(out/128), ceil(in/128)] inverse scales per block
 

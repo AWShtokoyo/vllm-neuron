@@ -20,7 +20,7 @@ this stage adds the softmax and the second matmul on top of that verified base.
 🔴 Partition axis: Sq on partitions, heads looped by the caller. See the header of
 glm52_mla_scores.py for why the shipped DeepSeek MLA kernels (which put H on
 partitions and assert H % 16 == 0, qk_nope_head_dim == 128, per-head d_v == 128)
-cannot be used for GLM-5.2 at TP=64 (1 head/rank, 192, 256).
+cannot be used for GLM at TP=64 (1 head/rank, 192, 256).
 
 🔴 Two hardware caps drive the tiling, both measured on this target (gen3):
   * nc_matmul MOVING free dim <= 512  -> key chunks of 512
@@ -48,7 +48,7 @@ def _kernel_assert(cond, msg):
 
 
 @nki.jit
-def glm52_mla_block_kernel(
+def glm_mla_block_kernel(
     q_lift_t, c_kv_t, q_pe_t, k_pe_t, mask_add, m_in, l_in, acc_in, softmax_scale
 ):
     """One online-softmax step over a key segment.

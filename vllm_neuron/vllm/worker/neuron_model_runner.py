@@ -738,7 +738,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
-        # MTP (Multi-Token Prediction) self-speculation — GLM-5.2 layer-78 head
+        # MTP (Multi-Token Prediction) self-speculation — GLM layer-78 head
         # as a γ=1 draft.
         self.is_mtp_spec = False
         self._draft_token_ids = None
@@ -4608,8 +4608,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Both Eagle3 and MTP run a prefill pass to seed the draft's KV during
         # the target's prefill (MTP mirrors upstream vLLM, which proposes at the
         # prefill step over the full prompt). The MTP draft's forward SP-shards
-        # its fused hidden before the reused Glm52DecoderLayer prefill path
-        # (glm_5_2/mtp.py), matching the base backbone's sharded-in/sharded-out
+        # its fused hidden before the reused GlmMoeDsaDecoderLayer prefill path
+        # (glm_moe_dsa/mtp.py), matching the base backbone's sharded-in/sharded-out
         # contract.
         if self.drafter is not None:
             logger.info(
@@ -8752,7 +8752,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
-                # An MLA draft layer (GLM-5.2 MTP layer 78) MUST emit
+                # An MLA draft layer (GLM MTP layer 78) MUST emit
                 # MLAAttentionSpec — a FullAttentionSpec here would give the
                 # draft a K+V (factor-2) page size while the target MLA layers
                 # use single-latent pages, so MLAAttentionSpec.merge

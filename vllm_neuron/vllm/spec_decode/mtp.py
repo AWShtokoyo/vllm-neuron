@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MTP (Multi-Token Prediction) self-speculative-decode proposer for GLM-5.2.
+"""MTP (Multi-Token Prediction) self-speculative-decode proposer for GLM.
 
-The layer-78 MTP head of GLM-5.2 is used as a γ=1 draft: it proposes one token
+The layer-78 MTP head of GLM is used as a γ=1 draft: it proposes one token
 per step which the target verifies in the same forward (S_decode=2 per seq).
 Acceptance is decided by the already-wired greedy rejection sampler.
 
@@ -12,7 +12,7 @@ with exactly three MTP-specific differences:
   1. ``method == "mtp"`` (not ``"eagle3"``).
   2. Single target hidden state ``[T, hidden]`` (no 3x aux-layer concat) in the
      synthetic warmup inputs.
-  3. The draft arch is hard-set to ``Glm52MtpForCausalLM`` — vLLM's
+  3. The draft arch is hard-set to ``GlmMoeDsaMtpForCausalLM`` — vLLM's
      ``SpeculativeConfig.hf_config_override`` rewrites a ``glm_moe_dsa`` draft's
      ``architectures`` to ``["DeepSeekMTPModel"]`` (speculative.py:290-295), so the
      Eagle3 ``f"Eagle3{arch}"`` prefix logic cannot be reused verbatim.
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 class MtpProposer:
-    """γ=1 self-speculative proposer backed by GLM-5.2's layer-78 MTP head.
+    """γ=1 self-speculative proposer backed by GLM's layer-78 MTP head.
 
     Public surface is identical to ``EagleProposer`` (the runner asserts
     ``isinstance(self.drafter, (EagleProposer, MtpProposer))`` at three sites).
@@ -250,7 +250,7 @@ class MtpProposer:
         # hf_config_override rewrote the raw glm_moe_dsa draft arch to
         # "DeepSeekMTPModel", so we cannot derive the name from
         # draft_model_config.architecture.
-        draft_model_arch = "Glm52MtpForCausalLM"
+        draft_model_arch = "GlmMoeDsaMtpForCausalLM"
 
         vllm_neuron_models = dict(get_models())
         if draft_model_arch not in vllm_neuron_models:

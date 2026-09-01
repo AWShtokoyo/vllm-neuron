@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GLM-5.2 Config
+GLM Config
 ======================
 
 MLA attention + MoE with DeepSeek Sparse Attention (DSA).
-DSA indexer is opt-in (`GLM52_DSA=1`); the default is full attention for all tokens.
+DSA indexer is opt-in (`VLLM_GLM_DSA=1`); the default is full attention for all tokens.
 """
 
 import json
@@ -17,7 +17,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 
 
 @dataclass
-class Glm52Config:
+class GlmMoeDsaConfig:
     vocab_size: int = 154880
     hidden_size: int = 6144
     intermediate_size: int = 12288
@@ -52,7 +52,7 @@ class Glm52Config:
     moe_layer_freq: int = 1
 
     # DSA (DeepSeek Sparse Attention) indexer. Carried through so the sparse path can
-    # be built; whether it RUNS is a separate decision (see Glm52Attention).
+    # be built; whether it RUNS is a separate decision (see GlmMoeDsaAttention).
     #
     # index_topk        rows each query attends to, regardless of context length
     # index_head_dim    indexer head width (independent of the MLA head dims)

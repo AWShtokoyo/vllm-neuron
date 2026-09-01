@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-GLM-5.2 Offline Inference Example
+GLM-5.3 Offline Inference Example
 ==================================
 
-Runs offline inference with the GLM-5.2 MoE model on Neuron (trn2.48xlarge),
+Runs offline inference with the GLM-5.3 MoE model on Neuron (trn2.48xlarge),
 in the configuration this port was actually brought up and verified in. See
-``GLM-5.2/README.md`` for the architecture, the FP8-only rationale and the
+``GLM-5.3/README.md`` for the architecture, the FP8-only rationale and the
 verification scope.
 
 Three things here are requirements, not preferences, and the model will not start
 without them:
 
-* **An FP8 checkpoint.** ``zai-org/GLM-5.2-FP8``, not ``zai-org/GLM-5.2``. BF16
+* **An FP8 checkpoint.** ``zai-org/GLM-5.3``, not ``zai-org/GLM-5.3-BF16``. BF16
   weights do not fit a trn2.48xlarge -- see "Why FP8 only" in the README.
 * **``quantization: "fp8_per_channel"``.** Reading an FP8 checkpoint is not the same as
   keeping FP8 weights on HBM; a mode that dequantizes at load time has the BF16
@@ -21,9 +21,9 @@ without them:
   ``max_model_len`` there is no segmentation, so leaving APC on fails at startup.
 
 This example does NOT set ``kv_segment_size_buckets``, so it takes the single-shot
-prefill path. That path has no DSA implementation, and ``Glm52Attention`` refuses to run
+prefill path. That path has no DSA implementation, and ``GlmMoeDsaAttention`` refuses to run
 rather than silently serving full attention while the config asks for sparse — so
-``GLM52_DSA=1`` left over in the environment would make this example raise
+``VLLM_GLM_DSA=1`` left over in the environment would make this example raise
 ``NotImplementedError``. It is unset below for exactly that reason: the flag is opt-in
 per run, and an example is not the place to inherit it from a shell.
 
@@ -40,10 +40,10 @@ from vllm import LLM, SamplingParams
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 
 # 🔴 Unset, not `setdefault`. This example uses single-shot prefill (no
-# kv_segment_size_buckets), which has no DSA path, so a GLM52_DSA=1 inherited from the
+# kv_segment_size_buckets), which has no DSA path, so a VLLM_GLM_DSA=1 inherited from the
 # shell makes the forward raise. The README tells readers to export that flag to try DSA;
 # without this line, following the README and then running the example fails.
-os.environ.pop("GLM52_DSA", None)
+os.environ.pop("VLLM_GLM_DSA", None)
 
 # Ensure neuronx-cc is on PATH for child worker processes
 import sys
@@ -86,7 +86,7 @@ def main():
     parser.add_argument(
         "--model-checkpoint",
         type=str,
-        default="zai-org/GLM-5.2-FP8",
+        default="zai-org/GLM-5.3",
         help="Path to (or HF id of) an FP8 checkpoint. BF16 does not fit.",
     )
     parser.add_argument(
@@ -107,7 +107,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # GLM-5.2: 64 attention heads, 256 routed experts
+    # GLM-5.3: 64 attention heads, 256 routed experts
     # EP config: world_size=64, ep_degree=16, tp_sub=4
     # Attention/Dense: sharded across full 64 ranks (1 head/rank)
     # MoE experts: 16 local, intermediate sharded by tp_sub=4 (512/rank)

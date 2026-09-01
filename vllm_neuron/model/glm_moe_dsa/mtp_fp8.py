@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 (fp8_per_channel ROW) variant of the GLM-5.2 MTP draft head.
+"""FP8 (fp8_per_channel ROW) variant of the GLM MTP draft head.
 
 Mirrors `model_fp8_per_channel.py` (the FP8 ROW target model) but scoped to the
 single layer-78 MTP head. The decoder body reuses the FP8 MoE / dense / shared-expert
@@ -12,8 +12,8 @@ and `load_weights` loads ONLY `model.layers.78.*` plus the base `embed_tokens` /
   * mlp.gate.weight [256,6144] + e_score_correction_bias [256] (BF16 / f32, NOT quantised).
   * MTP-only: eh_proj (BF16 replicated, D4), enorm, hnorm, shared_head.norm (D5).
   * self_attn.indexer.* (wq_b/wk block-FP8 → dequant, replicated; weights_proj and
-    k_norm.{weight,bias} BF16) — mapped only when GLM52_DSA is on, since that is
-    when Glm52Attention constructs the indexer. The draft layer owns a FULL
+    k_norm.{weight,bias} BF16) — mapped only when VLLM_GLM_DSA is on, since that is
+    when GlmMoeDsaAttention constructs the indexer. The draft layer owns a FULL
     indexer in the checkpoint (layer 78), so skipping it while the module exists
     would leave uninitialised memory in the selection path.
   * reuse base lm_head (D6, untied) + base embed_tokens.
@@ -36,12 +36,12 @@ from vllm_neuron.parallel.neuron_parallel_state import (
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
-from .config import Glm52Config
-from .mtp import Glm52MtpForCausalLM as Glm52MtpForCausalLMBF16, MTP_LAYER_IDX
+from .config import GlmMoeDsaConfig
+from .mtp import GlmMoeDsaMtpForCausalLM as GlmMoeDsaMtpForCausalLMBF16, MTP_LAYER_IDX
 from .model_fp8_per_channel import (
-    Glm52DenseMLPFP8Fwd,
-    Glm52MoELayerFP8Fwd,
-    Glm52SharedExpertMLPFP8Fwd,
+    GlmMoeDsaDenseMLPFP8Fwd,
+    GlmMoeDsaMoELayerFP8Fwd,
+    GlmMoeDsaSharedExpertMLPFP8Fwd,
     _fp8_row_moe_weight_loader,
     _fp8_row_weight_loader,
 )
@@ -55,8 +55,8 @@ from .weight_loaders_fp8 import (
 logger = logging.getLogger(__name__)
 
 
-class Glm52MtpForCausalLM(Glm52MtpForCausalLMBF16):
-    """GLM-5.2 MTP draft head with FP8 ROW quantization (per-row weight scales)."""
+class GlmMoeDsaMtpForCausalLM(GlmMoeDsaMtpForCausalLMBF16):
+    """GLM MTP draft head with FP8 ROW quantization (per-row weight scales)."""
 
     @torch.no_grad()
     def load_weights(
@@ -92,7 +92,7 @@ class Glm52MtpForCausalLM(Glm52MtpForCausalLMBF16):
         prefix = f"model.layers.{MTP_LAYER_IDX}"
         decoder = self.mtp.decoder
         attn = decoder.self_attn
-        moe = decoder.mlp  # Glm52MoELayerFP8Fwd (layer 78 is MoE)
+        moe = decoder.mlp  # GlmMoeDsaMoELayerFP8Fwd (layer 78 is MoE)
 
         # ---- checkpoint key mappings (module-attr path -> checkpoint key(s)) ----
         mappings: dict = {}
@@ -136,7 +136,7 @@ class Glm52MtpForCausalLM(Glm52MtpForCausalLMBF16):
         # DSA indexer on the draft layer, when DSA is on. 🔴 The draft layer OWNS a full
         # indexer: the checkpoint ships `model.layers.78.self_attn.indexer.*`, which is
         # why 22 layers carry indexer weights against the config's 21 "full" entries.
-        # Skipping it while `Glm52Attention` still constructs the module would leave
+        # Skipping it while `GlmMoeDsaAttention` still constructs the module would leave
         # `torch.empty` garbage in `wq_b`/`wk` and produce NaN selections in the draft --
         # a wrong-output failure with no load error, because an unmapped parameter is
         # simply never written. Mapped here rather than reused from the target's
@@ -352,22 +352,22 @@ class Glm52MtpForCausalLM(Glm52MtpForCausalLMBF16):
         start_layer_idx: int = MTP_LAYER_IDX,
         neuron_config: NeuronConfig | None = None,
     ):
-        config = Glm52Config.from_configs(hf_config, neuron_config)
+        config = GlmMoeDsaConfig.from_configs(hf_config, neuron_config)
         # Swap the base MLP classes for their FP8 ROW variants during construction,
-        # so Glm52DecoderLayer@78 builds an FP8 MoE + FP8 shared expert. Mirrors
+        # so GlmMoeDsaDecoderLayer@78 builds an FP8 MoE + FP8 shared expert. Mirrors
         # model_fp8_per_channel.from_configs:766-782.
-        import vllm_neuron.model.glm_5_2.model as model_mod
+        import vllm_neuron.model.glm_moe_dsa.model as model_mod
 
-        orig_dense = model_mod.Glm52DenseMLP
-        orig_shared = model_mod.Glm52SharedExpertMLP
-        orig_moe = model_mod.Glm52MoE
-        model_mod.Glm52DenseMLP = Glm52DenseMLPFP8Fwd
-        model_mod.Glm52SharedExpertMLP = Glm52SharedExpertMLPFP8Fwd
-        model_mod.Glm52MoE = Glm52MoELayerFP8Fwd
+        orig_dense = model_mod.GlmMoeDsaDenseMLP
+        orig_shared = model_mod.GlmMoeDsaSharedExpertMLP
+        orig_moe = model_mod.GlmMoeDsaMoE
+        model_mod.GlmMoeDsaDenseMLP = GlmMoeDsaDenseMLPFP8Fwd
+        model_mod.GlmMoeDsaSharedExpertMLP = GlmMoeDsaSharedExpertMLPFP8Fwd
+        model_mod.GlmMoeDsaMoE = GlmMoeDsaMoELayerFP8Fwd
         try:
             model = cls(config, start_layer_idx=start_layer_idx)
         finally:
-            model_mod.Glm52DenseMLP = orig_dense
-            model_mod.Glm52SharedExpertMLP = orig_shared
-            model_mod.Glm52MoE = orig_moe
+            model_mod.GlmMoeDsaDenseMLP = orig_dense
+            model_mod.GlmMoeDsaSharedExpertMLP = orig_shared
+            model_mod.GlmMoeDsaMoE = orig_moe
         return model

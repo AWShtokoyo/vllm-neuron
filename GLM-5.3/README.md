@@ -1,11 +1,11 @@
-# Contributed Model: GLM-5.2-FP8
+# Contributed Model: GLM-5.3
 
-vllm-neuron port of `zai-org/GLM-5.2-FP8` for AWS Trainium2, on the
+vllm-neuron port of `zai-org/GLM-5.3` for AWS Trainium2, on the
 **Neuron 2.32 stack (vLLM 0.24 / plugin 0.24.0.1.1.0)**.
 
-> If you are on the **Neuron 2.31 / vLLM 0.21** stack, use the
+> The **Neuron 2.31 / vLLM 0.21** stack is served by the
 > [`add-glm-5-2-231`](https://github.com/htokoyo/vllm-neuron/blob/add-glm-5-2-231/GLM-5.2/README.md)
-> tag instead: it holds the predecessor port for that stack, which this branch supersedes.
+> tag, which is the **GLM-5.2-FP8** port. This branch supersedes it.
 
 ## Change History
 
@@ -13,23 +13,31 @@ Newest first. Each entry links to the section with the full detail.
 
 | Date | Change |
 |---|---|
+| 2026-09-01 | Retargeted onto **`zai-org/GLM-5.3`**, which supersedes GLM-5.2-FP8. Verified on the new weights in the same pass: **[Automatic Prefix Caching](#accuracy-evaluation) enabled and measured** (60.2 % lower median TTFT, 1.25× output throughput, at the predicted hit rate); **[`decode_context_length_buckets`](#setting-decode_context_length_buckets-cuts-decode-time-by-a-third) measured for the first time** (−36.0 % TPOT, TTFT unchanged) and now recommended; **[batching](#batching-scales-to-612-at-the-engines-maximum) measured to the engine's ceiling** (6.12× at concurrency 8); **[DSA](#accuracy-evaluation) gained an identity control** (byte-identical to DSA off below the selection width) and a `gsm8k_cot` figure. |
 | 2026-08-31 | Re-hosted onto Neuron 2.32 / vllm-neuron 0.24 (from Neuron 2.31 / 0.21), and extended in the same release: **segmented prefill** made correct and verified on device to `max-model-len` 65536; **speculative decoding (MTP)** at `num_speculative_tokens=1`; the **DSA sparse-attention indexer** as an opt-in path that runs on device at one configuration. Also fixes a prior-KV mask bound in `forward_decode` reachable only under speculation. See [Verification scope](#verification-scope). |
 | 2026-07-28 | Initial contribution, on vllm-neuron 0.21 / Neuron 2.31. Adds the `glm_5_2` model package — a 78-layer decoder combining **Multi-head Latent Attention (MLA)** with a **256-expert MoE** (top-8 sigmoid routing plus one always-on shared expert, first three layers dense) — in **FP8 per-channel ROW** at TP=64 / EP=16, with the tiled MLA attention path, the FP8 dequant-and-shard weight loaders and the halved MLA KV page. Component equivalence against `transformers.models.glm_moe_dsa` 13/13 (all R < 1.2). The DSA indexer was **not** included and full attention was used instead. Superseded by this branch and kept at the [`add-glm-5-2-231`](https://github.com/htokoyo/vllm-neuron/blob/add-glm-5-2-231/GLM-5.2/README.md) tag for anyone still on that stack. |
 
 ## Introduction
 
-[GLM-5.2](https://huggingface.co/zai-org/GLM-5.2) is a large Mixture-of-Experts
+[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) is a large Mixture-of-Experts
 (MoE) text-generation model. This is the vllm-neuron implementation of it: a
 78-layer decoder that combines **Multi-head Latent Attention (MLA)** with a
 **256-expert MoE** feed-forward network (top-8 sigmoid routing plus one always-on
 shared expert; the first three layers are dense). It is served text-only under the
 architecture `GlmMoeDsaForCausalLM`.
 
-**Compatible model checkpoint:**
+**Compatible model checkpoints:**
 
-| Model | Precision | HuggingFace |
-|-------|-----------|-------------|
-| GLM-5.2-FP8 | FP8 (128×128 block-quantized) | [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) |
+| Model | Precision | HuggingFace | |
+|-------|-----------|-------------|---|
+| GLM-5.3 | FP8 (128×128 block-quantized) | [`zai-org/GLM-5.3`](https://huggingface.co/zai-org/GLM-5.3) | current default |
+| GLM-5.2-FP8 | FP8 (128×128 block-quantized) | [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) | still loads; produced the figures marked 5.2-FP8 below |
+
+Both work without a code change: the two checkpoints are identical in everything this port
+touches — `config.json` bar `transformers_version`, all 118,629 weight keys, and
+`quantization_config` — so they share the same compiled graphs. ⚠️ Note the naming is inverted
+between the two releases: 5.2's FP8 build carries the `-FP8` suffix while 5.3's does not
+(5.3's BF16 build is [`zai-org/GLM-5.3-BF16`](https://huggingface.co/zai-org/GLM-5.3-BF16)).
 
 **This port targets FP8 weights on HBM, because BF16 weights do not fit a
 `trn2.48xlarge`.** The model is large enough that the choice is made by HBM
@@ -43,8 +51,9 @@ and dequantizes inside the NKI kernels (see [Quantization](#quantization)).
 > [`fp8_per_channel`](https://github.com/vllm-project/vllm/blob/main/vllm/config/quantization.py)
 > shorthand, and the old name is no longer accepted.
 
-The BF16 release [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) is not a
-supported input for this port.
+The BF16 releases — [`zai-org/GLM-5.3-BF16`](https://huggingface.co/zai-org/GLM-5.3-BF16) and
+5.2's [`zai-org/GLM-5.2`](https://huggingface.co/zai-org/GLM-5.2) — are not supported inputs for
+this port.
 
 ## Verification scope
 
@@ -54,16 +63,20 @@ on the Neuron 2.32 stack.
 
 **Verified on device**
 
-| Area | What was verified |
-|---|---|
-| FP8 serving | Compiles and serves; coherent text at every configuration below |
-| Long context | `max-model-len` up to 65536 with an 8192-wide KV segment; 55/55 graphs, needles 3/3 at 29,212 and 3/3 at 58,408 tokens |
-| Segmented prefill | Correct at every supported segment width; prefill cost scales linearly with segment count (see [Measured performance](#measured-performance)) |
-| Accuracy | Component equivalence vs `transformers.models.glm_moe_dsa` 13/13 (all R < 1.2), and GSM8K-CoT at n=100 (see [Accuracy Evaluation](#accuracy-evaluation)) |
-| Determinism | Byte-identical continuation across the offline `LLM` API and the served endpoint on the same NEFFs, 3/3 repeats |
-| Speculative decoding (MTP) | Runs at `num_speculative_tokens=1`, repeatable 8/8, `gsm8k_cot` unchanged against a non-speculative run on the same build (see [Speculative decoding](#accuracy-evaluation)) |
-| DSA sparse-attention indexer | Opt-in (`GLM52_DSA=1`); serves at `max-model-len` 4096 with a 512-wide segment, needle retrieved at 10 / 50 / 90 % depth in a 3,521-token context |
-| Throughput / latency | TTFT and TPOT, single-request — `max-num-seqs` 1 for the segmented-prefill runs, 8 for the fixed-bucket latency run |
+The port was retargeted onto GLM-5.3 partway through verification, so the **Weights** column says
+which checkpoint produced each row. Shapes and graphs carry over between them; **accuracy does not**.
+
+| Area | Weights | What was verified |
+|---|---|---|
+| FP8 serving | both | Compiles and serves; coherent text at every configuration below |
+| Long context | 5.2-FP8 | `max-model-len` up to 65536 with an 8192-wide KV segment; 55/55 graphs, needles 3/3 at 29,212 and 3/3 at 58,408 tokens |
+| Segmented prefill | 5.2-FP8 | Correct at every supported segment width; prefill cost scales linearly with segment count (see [Measured performance](#measured-performance)) |
+| Accuracy | 5.2-FP8 | Component equivalence vs `transformers.models.glm_moe_dsa` 13/13 (all R < 1.2), and GSM8K-CoT at n=100 (see [Accuracy Evaluation](#accuracy-evaluation)) |
+| Determinism | 5.2-FP8 | Byte-identical continuation across the offline `LLM` API and the served endpoint on the same NEFFs, 3/3 repeats |
+| Speculative decoding (MTP) | 5.2-FP8 | Runs at `num_speculative_tokens=1`, repeatable 8/8, `gsm8k_cot` unchanged against a non-speculative run on the same build (see [Speculative decoding](#accuracy-evaluation)) |
+| DSA sparse-attention indexer | 5.2-FP8 needle, **5.3** control | Opt-in (`VLLM_GLM_DSA=1`); serves at `max-model-len` 4096 with a 512-wide segment, needle retrieved at 10 / 50 / 90 % depth in a 3,518-token context; below the selection width, byte-identical to DSA off |
+| Automatic Prefix Caching | **5.3** | 60.2 % lower median TTFT and 1.25× output throughput at a 73 % prefix-cache hit rate, against a no-overlap control on the same server |
+| Throughput / latency | 5.2-FP8 prefill ladder, **5.3** decode and batching | TTFT and TPOT — single-request for the segmented-prefill runs (`max-num-seqs` 1), and a concurrency sweep to the engine's ceiling of 8 at `max_model_len=4096` |
 
 **Not verified / out of scope**
 
@@ -72,9 +85,13 @@ on the Neuron 2.32 stack.
 | BF16 serving | Out of scope — the BF16 release does not fit one node, see [Why FP8 only](#why-fp8-only-hbm-capacity) |
 | End-to-end logit comparison vs HuggingFace | Blocked by host memory and by the reference implementation, not skipped — see [Accuracy Evaluation](#accuracy-evaluation) |
 | MTP byte-identity vs a non-speculative run | **Not expected to hold**, and not a defect; the verify step reads logits at a different shape — see [Accuracy Evaluation](#accuracy-evaluation) |
-| DSA beyond the one configuration above | Not exercised — see [Accuracy Evaluation](#accuracy-evaluation) |
-| NKI MLA attention kernel | Opt-in (`GLM52_MLA_BLOCK_KERNEL=1`), CPU-simulator validated only, **never run on device** |
+| DSA above `max_model_len=4096`, or alongside MTP | Not compiled, so not exercised — see [Accuracy Evaluation](#accuracy-evaluation) |
+| DSA **selecting** rather than covering | Only the 3,518-token needle test runs above the 2,048-key selection width — see [Accuracy Evaluation](#accuracy-evaluation) |
+| DSA speed against a matched dense run | No dense counterpart was built at that configuration, so neither a speedup nor a slowdown is claimed |
+| NKI MLA attention kernel | Opt-in (`VLLM_GLM_MLA_BLOCK_KERNEL=1`), CPU-simulator validated only, **never run on device** |
 | On-device top-k / top-p sampling | Supported by `OnDeviceSamplingConfig` (`max_top_k`), but not exercised — every configuration here compiled the `all_greedy` sampling graph |
+| `logprobs` on the served endpoint | Returns HTTP 500; the reported fix changes the sampling graph and is untested — see [Accuracy Evaluation](#accuracy-evaluation) |
+| Concurrency above `max_num_seqs=8`, or APC / DSA / MTP under concurrency | Not exercised — the batching figures are one prompt length at one `max_model_len` |
 | Parallel degrees other than TP=64 / EP=16 | Not exercised |
 | Pipeline parallelism, multi-node | Not implemented |
 
@@ -82,7 +99,7 @@ on the Neuron 2.32 stack.
 
 | | |
 |---|---|
-| HuggingFace ID | `zai-org/GLM-5.2-FP8` |
+| HuggingFace ID | `zai-org/GLM-5.3` |
 | Architecture | `GlmMoeDsaForCausalLM` |
 | Task | Text generation (`--runner generate`), prefill + decode |
 | Layers / hidden size | 78 / 6144 |
@@ -94,7 +111,7 @@ on the Neuron 2.32 stack.
 ## Model Architecture
 
 Values below come from the port's configuration
-([`vllm_neuron/model/glm_5_2/config.py`](../vllm_neuron/model/glm_5_2/config.py)).
+([`vllm_neuron/model/glm_moe_dsa/config.py`](../vllm_neuron/model/glm_moe_dsa/config.py)).
 
 **Core configuration**
 
@@ -134,7 +151,7 @@ Values below come from the port's configuration
 
 **Port-specific notes**
 
-- **DSA indexer: implemented, opt-in (`GLM52_DSA=1`), off by default.** `indexer_types` marks each
+- **DSA indexer: implemented, opt-in (`VLLM_GLM_DSA=1`), off by default.** `indexer_types` marks each
   layer `full` or `shared`: 21 `full` layers compute a top-`index_topk` selection and the 57
   `shared` layers reuse the nearest preceding one, so every layer ends up sparse while only 21
   carry weights. Two consequences that decide whether you can turn it on:
@@ -163,7 +180,7 @@ default `gpu_memory_utilization=0.92` leaves **22.08 GB per rank** for weights, 
 cache, activations and scratch combined.
 
 Counting this port's own configuration
-([`config.py`](../vllm_neuron/model/glm_5_2/config.py)) — 78 layers of MLA plus 75
+([`config.py`](../vllm_neuron/model/glm_moe_dsa/config.py)) — 78 layers of MLA plus 75
 MoE layers of 256 experts, 3 dense layers, untied embeddings, and the checkpoint's
 layer-78 head — gives **≈753 B parameters** to place on device:
 
@@ -184,18 +201,19 @@ configuration this port documents.
 
 > This table is a **derivation from the model configuration and the published HBM capacity, not
 > a measurement.** The one cross-check available is that ≈753 GB matches the size of the
-> `zai-org/GLM-5.2-FP8` checkpoint as downloaded.
+> `zai-org/GLM-5.3` checkpoint as downloaded.
 
 ## Required knobs
 
-Three settings this model requires. Each is load-bearing: without it the run fails at startup
+Four settings this model requires. Each is load-bearing: without it the run fails at startup
 or at compile time, and none of them announce the cause.
 
 | Item | What happens, and what to do |
 |---|---|
-| **`enable_prefix_caching=False`** | vLLM 0.24 turns APC on by default (`CacheConfig.enable_prefix_caching = True`), and vllm-neuron rejects APC unless `max_num_batched_tokens` ∈ {512, 1024, 2048, 4096, 8192}. A single-shot recipe therefore **fails at startup** with "Automatic Prefix Caching (APC) requires segmented prefill to be enabled". Every configuration below and in [Verification scope](#verification-scope) disables it; APC itself is neither enabled nor measured on this port. |
+| **`enable_prefix_caching=False`** | vLLM 0.24 turns APC on by default (`CacheConfig.enable_prefix_caching = True`), and vllm-neuron rejects APC unless segmented prefill is on. A single-shot recipe therefore **fails at startup** with "Automatic Prefix Caching (APC) requires segmented prefill to be enabled". Every configuration below disables it. APC does work on this port — the next row is what it takes. |
+| **APC needs three settings together, or it breaks** | If you want prefix caching: (1) `max_num_batched_tokens` **strictly below** `max_model_len` — equal values give single-shot prefill and APC is rejected at startup; (2) `num_batched_tokens_buckets` set **explicitly** — leave it out and the plugin auto-sets it to the segment size alone, after which the first cache hit changes the prefill length, falls outside the compiled buckets and **takes the engine down** with `Detected recompile`; (3) prompts whose shared prefix is a **whole multiple of the segment size** — a prefix that does not fill a segment leaves nothing to skip. |
 | **`VLLM_NEURON_BARRIER_TIMEOUT` (default 3600 s) is too short** | While rank 0 compiles, the other 63 ranks wait in `tp_barrier()`. If the barrier fires first they exit and the run dies mid-build — **after every graph has compiled and been cached**, so the work is not lost but the run is. Raise it well past rank 0's whole cold compile — which ran **4.63 h** in one of the configurations below; see [Step 1](#step-1-environment-setup). |
-| **A 512-wide prefill segment when `GLM52_DSA=1`** | At a 1024-wide segment the compiler aborts with `[INTERNAL_ERROR] [NCC_ILSA901] LegalizeSundaAccess assertion error: unexpected AP of matmult dst`; the cause is under investigation. **Use a 512-wide segment** — every DSA configuration in this README was verified with it. |
+| **A 512-wide prefill segment when `VLLM_GLM_DSA=1`** | At a 1024-wide segment the compiler aborts with `[INTERNAL_ERROR] [NCC_ILSA901] LegalizeSundaAccess assertion error: unexpected AP of matmult dst`; the cause is under investigation. **Use a 512-wide segment** — every DSA configuration in this README was verified with it. |
 
 ## Feature status
 
@@ -209,21 +227,20 @@ or at compile time, and none of them announce the cause.
 | | Expert parallelism (EP) | ✅ | `ep_degree` in `neuron_config` |
 | | Pipeline / context parallelism | ❌ | |
 | **Attention** | Multi-head Latent Attention (MLA) | ✅ | `MLAAttentionSpec`, halved KV page |
-| | DSA sparse-attention indexer | ⚠️ experimental | `GLM52_DSA=1`; validated on CPU against `transformers.models.glm_moe_dsa` (selection set matches the reference exactly) and **runs on device at one verified configuration** (`max_model_len=4096`, 512-wide prefill segment, needle retrieved at 10/50/90% depth in a 3,521-token context). Off by default — still under verification towards a supported implementation |
-| | NKI MLA attention kernel | ⚠️ not on device | `GLM52_MLA_BLOCK_KERNEL=1`; **CPU-simulator validated only, never run on device** — off by default. Running it on device is planned |
+| | DSA sparse-attention indexer | ⚠️ experimental | `VLLM_GLM_DSA=1`; validated on CPU against `transformers.models.glm_moe_dsa` (selection set matches the reference exactly) and **runs on device at one verified configuration** (`max_model_len=4096`, 512-wide prefill segment, needle retrieved at 10/50/90% depth in a 3,518-token context; `gsm8k_cot` 0.91 at n=100). ⚠️ The `gsm8k_cot` figure does **not** test sparsity — its prompts sit below the 2,048-key selection width, where the selection is all-inclusive; only the needle test exercises real sparsity ([detail](#accuracy-evaluation)). Off by default — still under verification towards a supported implementation |
+| | NKI MLA attention kernel | ⚠️ not on device | `VLLM_GLM_MLA_BLOCK_KERNEL=1`; **CPU-simulator validated only, never run on device** — off by default. Running it on device is planned |
 | **Speculative decoding** | MTP self-speculation | ✅ opt-in | `--speculative-config '{"method":"mtp","num_speculative_tokens":1}'`. Runs on device, repeatable 8/8, and `gsm8k_cot` is unchanged against a non-speculative run on the same build (see [Accuracy Evaluation](#accuracy-evaluation)). Off unless explicitly enabled |
 | **Context** | `max_model_len` ≤ 16,384 (single-shot prefill) | ✅ | vllm-neuron 0.24 caps single-shot at `MAX_MODEL_LEN_SINGLE_SHOT` = 16 KiB |
 | | `max_model_len` > 16,384 | ✅ | Requires chunked prefill (✅ below). Verified on device at **65,536** with `kv_segment_size=8192` (the largest supported segment size): a 58,408-token prompt spanning 8 segments retrieved facts planted in segments 0, 3 and 6. Also verified at 16,384 with `kv_segment_size=4096` |
 | **Performance** | Segmented (chunked) prefill | ✅ | Verified on device at `max_model_len=16384` / `kv_segment_size=4096`: facts planted in segments 0, 1 and 2 of an 8,800-token prompt and in 0, 1 and 3 of a 15,100-token one were all retrieved, so the prior-KV path resolves across segment boundaries on hardware. |
-| | Automatic Prefix Caching (APC) | ⚠️ not exercised | The blocker is gone (0.24 requires segmented prefill for APC, which now works), but APC itself has not been switched on or measured. Every configuration in this README passes `enable_prefix_caching=False` |
+| | Automatic Prefix Caching (APC) | ✅ opt-in | Measured on device: **60.2 % lower median TTFT** and **1.25× output throughput** on a shared-prefix workload against a no-overlap control. Needs three settings or it fails — see [Required knobs](#required-knobs) and [Accuracy Evaluation](#accuracy-evaluation). Off in every other configuration here |
 | | On-device sampling — greedy | ✅ | `on_device_sampling_config: {"all_greedy": true}`. Every configuration verified here used it; `SamplingParams(temperature=0)` alone does not select it |
 | **Compilation** | torch.compile (XLA backend) | ✅ | |
 
 Legend: **✅** verified on device and usable — `opt-in` means it works but is off by default ·
 **⚠️** integrated but not yet dependable, with the qualifier saying why — `experimental` ran on
-device in one narrow configuration, `not on device` was verified only off device, `not exercised`
-was never enabled · **❌** not implemented. See [Verification scope](#verification-scope) for
-exactly what was measured.
+device in one narrow configuration, `not on device` was verified only off device · **❌** not
+implemented. See [Verification scope](#verification-scope) for exactly what was measured.
 
 ## Setup
 
@@ -232,8 +249,8 @@ exactly what was measured.
 The model is **natively integrated** into this repository — check out this branch
 and it works; there is no patch to apply.
 
-- **Model package:** [`vllm_neuron/model/glm_5_2/`](../vllm_neuron/model/glm_5_2/)
-  (per-file breakdown: [module structure](../vllm_neuron/model/glm_5_2/README.md)).
+- **Model package:** [`vllm_neuron/model/glm_moe_dsa/`](../vllm_neuron/model/glm_moe_dsa/)
+  (per-file breakdown: [module structure](../vllm_neuron/model/glm_moe_dsa/README.md)).
 - **Registration and framework touch-points** are committed directly on this
   branch — see
   [Paths this port touches](#paths-this-port-touches-across-the-repository).
@@ -247,7 +264,7 @@ and it works; there is no patch to apply.
 - **An FP8 checkpoint and an FP8 `quantization` mode are required**, not optional:
   see [Why FP8 only](#why-fp8-only-hbm-capacity). Provision the checkpoint
   filesystem for ≈753 GB.
-- GLM-5.2 is large. The shipped example uses `tensor_parallel_size=64`, which at
+- GLM-5.3 is large. The shipped example uses `tensor_parallel_size=64`, which at
   LNC2 is the 64 logical cores of one `trn2.48xlarge`. Size the checkpoint
   filesystem accordingly.
 
@@ -305,7 +322,7 @@ export NKI_COMPILE_CACHE_URL=/path/to/cache/nki
 ### Step 2: Download the model
 
 ```bash
-huggingface-cli download zai-org/GLM-5.2-FP8 --local-dir /path/to/GLM-5.2-FP8
+huggingface-cli download zai-org/GLM-5.3 --local-dir /path/to/GLM-5.3
 ```
 
 > **Tip:** Download to a filesystem provisioned for the full ≈753 GB, not a home
@@ -315,17 +332,17 @@ huggingface-cli download zai-org/GLM-5.2-FP8 --local-dir /path/to/GLM-5.2-FP8
 
 ### Offline inference (`llm.generate()`)
 
-[`examples/vllm_neuron/models/glm_5_2/run.py`](../examples/vllm_neuron/models/glm_5_2/run.py)
+[`examples/vllm_neuron/models/glm_moe_dsa/run.py`](../examples/vllm_neuron/models/glm_moe_dsa/run.py)
 carries the verified recipe and applies most of the `export`s above via `os.environ.setdefault`,
 so the only thing it needs is the checkpoint:
-`python run.py --model-checkpoint /path/to/GLM-5.2-FP8`. An explicit `export` still wins, since
+`python run.py --model-checkpoint /path/to/GLM-5.3`. An explicit `export` still wins, since
 `setdefault` only fills unset variables.
 
 ### Online serving (OpenAI-compatible)
 
 ```bash
-vllm serve /path/to/GLM-5.2-FP8 \
-    --served-model-name GLM-5.2 \
+vllm serve /path/to/GLM-5.3 \
+    --served-model-name GLM-5.3 \
     --max-model-len 4096 \
     --max-num-seqs 8 \
     --tensor-parallel-size 64 \
@@ -339,7 +356,7 @@ model size. Wait for `Application startup complete.`, then:
 ```bash
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
-    -d '{"model": "GLM-5.2", "prompt": "The capital of France is",
+    -d '{"model": "GLM-5.3", "prompt": "The capital of France is",
          "max_tokens": 16, "temperature": 0}'
 ```
 
@@ -352,6 +369,10 @@ curl http://localhost:8000/v1/completions \
   must hold, and `ep_degree` requires `--enable-expert-parallel`.
 - `num_batched_tokens_buckets` / `num_seqs_buckets` — prefill-token and
   batch-size buckets. Every bucket adds compile time; start with one of each.
+- `decode_context_length_buckets` — worth setting. Left unset, decode falls back to
+  `max_model_len` and reads the whole bucket's latent every step; setting it to the context you
+  actually serve cut TPOT by **36 %** here, with TTFT unchanged
+  ([measurement](#setting-decode_context_length_buckets-cuts-decode-time-by-a-third)).
 - `quantization` — set it to `fp8_per_channel`. This is **not optional**: without it the
   weights are held in BF16, which does not fit one node
   ([why](#why-fp8-only-hbm-capacity)).
@@ -364,7 +385,7 @@ node ([why](#why-fp8-only-hbm-capacity)):
 
 | | `fp8_per_channel` |
 |---|---|
-| Checkpoint | `zai-org/GLM-5.2-FP8` (128×128 block-quantized) |
+| Checkpoint | `zai-org/GLM-5.3` (128×128 block-quantized) |
 | Weights on HBM | FP8 `e4m3` + a per-output-channel (per-row) dequant scale vector |
 | Where dequant happens | Inside the NKI kernels (`QuantizationType.ROW`) |
 | Activation scales | Not required |
@@ -379,8 +400,8 @@ BF16 is the one exception, and the MLP/MoE weights (75 layers × 256 experts) do
 capacity conclusion above holds.
 
 ```bash
-vllm serve /path/to/GLM-5.2-FP8 \
-    --served-model-name GLM-5.2 \
+vllm serve /path/to/GLM-5.3 \
+    --served-model-name GLM-5.3 \
     --max-model-len 4096 --max-num-seqs 8 \
     --tensor-parallel-size 64 --enable-expert-parallel --no-enable-prefix-caching \
     --additional-config '{"neuron_config": {"ep_degree": 16, "quantization": "fp8_per_channel"}}'
@@ -393,7 +414,7 @@ vllm serve /path/to/GLM-5.2-FP8 \
 `weight_block_size: [128, 128]`) says **how the checkpoint is stored**; `neuron_config.quantization`
 says **what this port puts on HBM**. `config.py` never reads the checkpoint's field — the block
 size of 128 lives in
-[`weight_loaders_fp8.py`](../vllm_neuron/model/glm_5_2/weight_loaders_fp8.py). And whatever
+[`weight_loaders_fp8.py`](../vllm_neuron/model/glm_moe_dsa/weight_loaders_fp8.py). And whatever
 `activation_scheme` says, this port quantizes weights only; activations stay in BF16.
 
 ## Accuracy Evaluation
@@ -438,6 +459,10 @@ R < 1 (0.83, 0.91, 0.96) means the port sits *closer* to the FP32 reference than
 own BF16 does; for RMSNorm the cause is explicit, HF rounds the normalised hidden to bf16
 *before* the weight multiply while this port keeps the multiply in FP32.
 
+> ⚠️ Run against the **GLM-5.2-FP8** config, before the retarget. It uses random weights rather
+> than the checkpoint's, so what carries over to 5.3 is exactly what the two configs share — and
+> `config.json` is identical bar `transformers_version`.
+
 **2. Accuracy — downstream task.** GSM8K-CoT through the served endpoint, 8-shot,
 `do_sample=False`, `num_concurrent=8`:
 
@@ -446,16 +471,17 @@ own BF16 does; for RMSNorm the cause is explicit, HF rounds the normalised hidde
 | flexible-extract | **90.0%** | ±3.02 |
 | strict-match | **88.0%** | ±3.27 |
 
-> ⚠️ **n = 100**, via `--limit`. See the caveat in
-> [Verification scope](#verification-scope) before quoting it. This run is configuration **B**
+> ⚠️ **n = 100**, via `--limit`, on **GLM-5.2-FP8 weights** — measured before the retarget and not
+> re-measured on 5.3, and accuracy is the one thing that depends on the weights rather than on the
+> shapes the two checkpoints share. This run is configuration **B**
 > (`max_model_len=4096`, `max_num_seqs=8`); the pair in **4** below is a **separate, later run**
 > at `max_model_len=2048` / `max_num_seqs=1`, which is why its numbers differ from these by about
 > one standard error.
 
 ```bash
 lm_eval --model local-completions \
-  --model_args "model=GLM-5.2,base_url=http://localhost:8000/v1/completions,\
-num_concurrent=8,max_retries=3,timeout=1800,tokenized_requests=False,tokenizer=/path/to/GLM-5.2-FP8" \
+  --model_args "model=GLM-5.3,base_url=http://localhost:8000/v1/completions,\
+num_concurrent=8,max_retries=3,timeout=1800,tokenized_requests=False,tokenizer=/path/to/GLM-5.3" \
   --tasks gsm8k_cot --batch_size 1 --limit 100
 ```
 
@@ -475,6 +501,8 @@ and the same instance:
 | same prompt → same output | **8 of 8** | 8 of 8 |
 | byte-identical to the other column | 4 of 8 | — |
 
+> ⚠️ Measured on **GLM-5.2-FP8** weights, before the retarget, and not re-measured on 5.3.
+
 **Byte-identity is not the right test, and its absence is not a defect.** The verify step reads the
 target's logits at a different shape from a non-speculative step, so the two are not the same
 floating-point expression. Standing in for a direct check, and off device: a 5-layer CPU comparison
@@ -482,36 +510,75 @@ puts the logit difference between the shapes at **3.1e-02** against a top-1/top-
 **1.25e+00** — a 40× margin, so the shape rarely changes which token wins.
 
 > ⚠️ So "every divergence is a near-tie" is *inferred*, not checked position by position:
-> `logprobs` on `/v1/completions` raises. It needs `max_logprobs` and `--no-async-scheduling`; the
-> offline `LLM` API returns them without either.
+> `logprobs` on `/v1/completions` returns **HTTP 500 `list index out of range`** on this build. The
+> same request without `logprobs` succeeds immediately before and after it, so the failure belongs to
+> `logprobs` and not to a sick engine. It is reported to need `max_logprobs` and
+> `--no-async-scheduling` — untested here, because `max_logprobs` changes the sampling graph and
+> costs a cold compile — and the offline `LLM` API is reported to return them without either.
 
-**5. DSA sparse-attention indexer.** Opt-in (`GLM52_DSA=1`), and what was verified is narrow:
+**5. DSA sparse-attention indexer.** Opt-in (`VLLM_GLM_DSA=1`), and what was verified is narrow:
 
-| | |
-|---|---|
-| Configuration | `max_model_len=4096`, 512-wide KV segment, one decode context bucket at 2048, `max_num_seqs=1` |
-| Graphs compiled | 896, no compile errors |
-| KV cache | 64,736 tokens, against 79,136 with DSA off — the 704/576 row-width ratio |
-| Retrieval, 3,518-token context (the selection keeps 2,048 of 3,518 keys) | needle found at **10 %, 50 % and 90 % depth** |
-| Decode latency at that context | **155.7 ms/token**, from the slope of two output lengths (8 and 72, `ignore_eos`) so prefill and client overhead cancel |
+| | Weights | |
+|---|---|---|
+| Configuration | — | `max_model_len=4096`, 512-wide KV segment, one decode context bucket at 2048, `max_num_seqs=1` |
+| Graphs compiled | 5.2-FP8 | 896, no compile errors |
+| KV cache | 5.2-FP8 | 64,736 tokens, against 79,136 with DSA off — the 704/576 row-width ratio |
+| Retrieval, 3,518-token context (the selection keeps 2,048 of 3,518 keys) | 5.2-FP8 | needle found at **10 %, 50 % and 90 % depth** |
+| Decode latency at that context | 5.2-FP8 | **155.7 ms/token**, from the slope of two output lengths (8 and 72, `ignore_eos`) so prefill and client overhead cancel |
+| Identity control below the selection width | **5.3** | 128 greedy tokens from a 1,012-token prompt are **byte-identical** to the same request with DSA off |
+| Accuracy with the indexer active | **5.3** | `gsm8k_cot` at n=100: **0.91** ± 0.029 strict-match, **0.90** ± 0.030 flexible-extract |
+
+> ⚠️ The rows marked 5.2-FP8 were measured before the retarget and not re-measured on 5.3. The
+> graph count and the KV figure are shape facts, so they carry over; the needle result and the
+> latency depend on the weights.
 
 > ⚠️ The 90 % case is the one that means something. At 50 % the needle sits inside the first 2,048
 > keys, so a selection that took the leading window — or one that was silently inert — would retrieve
 > it too. At 90 % it is outside any leading window, so retrieval requires the scores to have ranked
 > that region.
 
+> ⚠️ **The last two rows do not test sparsity.** The code takes `min(index_topk, S_kv)`, so below
+> 2,048 keys the selection is all-inclusive — the sparse path still runs, but it never has to choose.
+> Both rows sit there (the GSM8K prompts are ~1,000 tokens), so what they check is the index
+> arithmetic: drop one legitimate key and the softmax denominator moves, breaking byte-equality.
+> Only the needle test above exercises real sparsity.
+
 > 🔴 **Not claimed.** No speed figure, because there is no dense counterpart built the same way at
-> the same configuration. No accuracy benchmark with DSA on — three needle prompts are not an
-> evaluation. Nothing above `max_model_len=4096` has been compiled with DSA, and it has not been run alongside speculative decoding. And **DSA does not
+> the same configuration. No accuracy benchmark on a workload whose context exceeds the 2,048-key
+> selection width — that needs a DSA build above `max_model_len=4096`, and none has been compiled.
+> DSA has not been run alongside speculative decoding. And **DSA does not
 > reduce work in this form**: the attention pass still visits every key and masks the unselected
 > ones, so what it buys is fidelity to the trained model, not speed.
 
+**6. Automatic Prefix Caching (APC).** Two runs of the same benchmark on the same server, with
+`--prefix-repetition-num-prefixes` as the only variable — 5 distinct prefixes shared across 50
+prompts (heavy reuse) against 50 distinct prefixes (nothing to reuse). On **GLM-5.3** weights.
+`max_model_len=2048`, `kv_segment_size=512`, prefix 1,536 tokens (three whole segments), suffix 384,
+output 128, `--max-concurrency 1`, `--ignore-eos`:
+
+| | Median TTFT | Output throughput | Prefix cache hit rate |
+|---|---:|---:|---:|
+| 5 shared prefixes | **1,762 ms** | **13.66 tok/s** | 73–74 % |
+| 50 distinct prefixes (control) | 4,429 ms | 10.89 tok/s | ~0 % |
+| | **−60.2 %** | **1.25×** | |
+
+The hit rate matches the 72.0 % the workload's token counts predict, and the TTFT saving is 80 % of
+the 75 % ceiling that skipping three of four segments allows.
+
+> ⚠️ **The control is what makes this a measurement.** A first request is often faster than its
+> successors here for reasons unrelated to caching — probing by hand with three repeats gave 0.905 s
+> on a shared-prefix request *and* 1.789 s on an unrelated one, both against a 3.88 s steady state,
+> so a single fast request proves nothing. Only the median over 50 prompts, against a workload with
+> no overlap, separates prefix reuse from that effect.
+
+> ⚠️ **What is not claimed.** One shape at one segment size, single concurrency. Nothing is measured
+> for concurrent requests, for larger `max_model_len`, or with DSA or MTP enabled alongside it.
+
 ## Measured performance
 
-> ⚠️ Single-request throughout, on the configurations under
-> [Accuracy Evaluation](#accuracy-evaluation), warm compile cache, greedy on-device sampling. Not a
-> deployment characterisation: `decode_context_length_buckets` has never been set, and no
-> batched throughput figure has been measured on this port.
+> ⚠️ Measured on the configurations under [Accuracy Evaluation](#accuracy-evaluation), with greedy
+> on-device sampling. Single-request except where a concurrency is stated. Not a deployment
+> characterisation: every figure comes from one instance and one prompt distribution.
 
 ### Benchmarking this port yourself
 
@@ -523,14 +590,14 @@ numbers. Run it against a server started as in
 ```bash
 vllm bench serve \
     --base-url http://localhost:8000 \
-    --model GLM-5.2 \
-    --tokenizer /path/to/GLM-5.2-FP8 \
+    --model GLM-5.3 \
+    --tokenizer /path/to/GLM-5.3 \
     --dataset-name random \
     --random-input-len 32 --random-output-len 96 \
     --random-range-ratio 0 \
     --num-prompts 4 --max-concurrency 1 \
     --ignore-eos \
-    --save-result --result-filename glm52_bench_decode.json
+    --save-result --result-filename glm53_bench_decode.json
 ```
 
 Four flags are load-bearing. `--random-range-ratio 0` pins the input length — without it the
@@ -544,7 +611,11 @@ the `fail_on_recompile` stance here, so the recompile raises and **takes the eng
 
 ### Prefill scales linearly with segment count
 
-Segmented prefill, 8 output tokens, sole client:
+Segmented prefill, 8 output tokens, sole client.
+
+> ⚠️ Measured on **GLM-5.2-FP8** weights, before the retarget. Prefill cost is set by the bucket
+> shapes, which the two checkpoints share, so these figures are expected to hold on 5.3 — but they
+> were not re-measured there.
 
 | Prompt tokens | Segments | `mml=16384` / `seg=4096` | `mml=65536` / `seg=8192` |
 |---:|---:|---:|---:|
@@ -579,6 +650,9 @@ because a data-dependent one cannot be traced on device.
 
 `max_model_len=4096`, `max_num_seqs=8`, 32 output tokens:
 
+> ⚠️ Measured on **GLM-5.2-FP8** weights, before the retarget. The 373.37 ms baseline in the next
+> section is the same shape re-measured on 5.3, and it agrees to 0.2 %.
+
 | Prompt tokens | 32 | 249 | 993 | 1,985 | 2,907 | 3,682 |
 |---|---:|---:|---:|---:|---:|---:|
 | TTFT | 2.16 s | 2.16 s | 2.16 s | 2.16 s | 2.16 s | 2.16 s |
@@ -590,25 +664,63 @@ TTFT spread across the six prompts is 0.005 s (stdev 0.002 s); TPOT varies by 0.
 Both are bucketing, not scaling. Prefill pads to the single 4,096-token bucket, so it does
 identical work regardless of prompt length. Decode falls back to `max_model_len` because
 `decode_context_length_buckets` is unset, so it gathers the full bucket's latent every step
-no matter how short the real context is. ⇒ **Setting `decode_context_length_buckets` is a
-configuration-only decode improvement**, independent of any kernel work. It is not yet
-measured.
+no matter how short the real context is.
 
-> ⚠️ **No batched throughput number has been measured on this port.** MLA keeps one
-> compressed latent per token and it is not TP-shardable, so every rank reads the whole
-> latent for every sequence every step, which is a reason to expect batching to help less
-> here than it would for a GQA model — but that expectation is untested, and the figures
-> above are all single-request.
+### Setting `decode_context_length_buckets` cuts decode time by a third
+
+Same server configuration, same benchmark (993-token prompts, 32 output tokens,
+`--max-concurrency 1`), on **GLM-5.3** weights, with `decode_context_length_buckets` as the only
+variable:
+
+| | unset (falls back to `max_model_len` = 4,096) | `[2048]` |
+|---|---:|---:|
+| Median TPOT | 373.37 ms | **238.94 ms** |
+| Median TTFT | 2,171.38 ms | 2,170.95 ms |
+
+**−36.0 % on decode (1.56×), with TTFT unchanged to within 0.5 ms** — the knob narrows the decode
+bucket only, and the measurement agrees. No kernel work behind it, so it applies to any deployment
+whose real contexts are shorter than `max_model_len`.
+
+> ⚠️ One prompt length, one bucket value, single concurrency. Adding the bucket costs a partial
+> recompile: 64 decode graphs here, against the 128 the full configuration needs, because the prefill
+> graphs are reused.
+
+### Batching scales to 6.12× at the engine's maximum
+
+Same server, same workload (993-token prompts, 128 output tokens, `--ignore-eos`), on **GLM-5.3**
+weights, varying only `--max-concurrency`. `max_model_len=4096`, `max_num_seqs=8`, so 8 is the
+ceiling the engine allows:
+
+| Concurrency | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Output throughput | 2.58 tok/s | 4.91 tok/s | 9.08 tok/s | **15.79 tok/s** |
+| Speedup over concurrency 1 | 1.00× | 1.90× | 3.52× | **6.12×** |
+| Median TPOT | 373.06 ms | 381.69 ms | 398.65 ms | 432.48 ms |
+
+At the engine's maximum batch, throughput is **6.12× the single-request figure — 77 % of the ideal
+8×** — and per-token latency degrades only **15.9 %**.
+
+TTFT is the cost side: **5,788 ms** at concurrency 4 against **2,172 ms** at 1. Prefill itself did
+not slow down — median inter-token latency is 373.0 ms at both — the later requests are queuing for
+a prefill slot.
+
+> ⚠️ **This retires a prediction this README used to make.** MLA's compressed latent is not
+> TP-shardable, so every rank reads the whole latent for every sequence every step, and batching was
+> expected to help less than for a GQA model. It does not — so the latent read is not what binds
+> decode at these batch sizes. What does has not been measured.
+
+> ⚠️ Measured at one prompt length and one `max_model_len`, with `decode_context_length_buckets`
+> unset. Nothing above `max_num_seqs=8` was tried.
 
 ## Contents of this bundle
 
 The model is integrated in-tree (committed directly on this branch), so this
-top-level `GLM-5.2/` bundle is supplementary: it carries the source-of-truth
+top-level `GLM-5.3/` bundle is supplementary: it carries the source-of-truth
 README only. There is no `src/` copy here — that would duplicate the in-tree
 package.
 
 ```text
-GLM-5.2/
+GLM-5.3/
 └── README.md            # This file — the source of truth for the port
 ```
 
@@ -621,24 +733,24 @@ it and an explicit statement of what remains unverified.
 Everything below is stated against the branch this port is based on,
 `release-0.24.0.1.1.0` (vllm-neuron 0.24 / Neuron 2.32).
 
-**New — model package** (`vllm_neuron/model/glm_5_2/`)
+**New — model package** (`vllm_neuron/model/glm_moe_dsa/`)
 
 ```text
-vllm_neuron/model/glm_5_2/
-├── __init__.py                # Package exports (Glm52Config, Glm52ForCausalLM)
+vllm_neuron/model/glm_moe_dsa/
+├── __init__.py                # Package exports (GlmMoeDsaConfig, GlmMoeDsaForCausalLM)
 ├── README.md                  # Module structure (points at this README)
-├── config.py                  # Glm52Config: HF → Neuron config translation (MLA ranks,
+├── config.py                  # GlmMoeDsaConfig: HF → Neuron config translation (MLA ranks,
 │                              #   MoE routing, first_k_dense_replace, interleaved RoPE)
-├── factory.py                 # Glm52ForCausalLM factory: validates the config and selects
+├── factory.py                 # GlmMoeDsaForCausalLM factory: validates the config and selects
 │                              #   the implementation from `quantization`
 ├── mla_block.py               # NKI dispatch for the MLA inner attention block, opt-in via
-│                              #   GLM52_MLA_BLOCK_KERNEL=1 — default OFF, simulator-only
+│                              #   VLLM_GLM_MLA_BLOCK_KERNEL=1 — default OFF, simulator-only
 ├── mla_block_kernel.py        # The NKI kernel itself: one online-softmax step over a key
 │                              #   segment (score + max + rescale + accumulate)
 ├── dsa_indexer.py             # The DSA indexer: per-query top-k key selection (score, relu
 │                              #   before the head-weighted sum, LayerNorm k_norm, interleaved
 │                              #   RoPE), plus the streaming running-top-k fold and the additive
-│                              #   segment mask attention consumes. Opt-in via GLM52_DSA=1
+│                              #   segment mask attention consumes. Opt-in via VLLM_GLM_DSA=1
 ├── model_fp8_per_channel.py   # quantization="fp8_per_channel": per-row (ROW) FP8 on HBM, dequant
 │                              #   in-kernel — the supported configuration
 ├── mtp_fp8.py                 # FP8 ROW variant of mtp.py — unsupported path
@@ -647,7 +759,7 @@ vllm_neuron/model/glm_5_2/
 │                              #   256-expert top-8 sigmoid MoE with a shared expert, first 3
 │                              #   layers dense. Holds the module graph and the BF16 forward
 │                              #   path; its own BF16 weight footprint does not fit one node
-└── mtp.py                     # Glm52MtpForCausalLM: layer-78 head that mtp_fp8.py extends —
+└── mtp.py                     # GlmMoeDsaMtpForCausalLM: layer-78 head that mtp_fp8.py extends —
                                #   unsupported path, not exercised on device
 ```
 
@@ -661,17 +773,17 @@ vllm_neuron/vllm/spec_decode/mtp.py   # MtpProposer — mirrors the EaglePropose
 **New — docs & example**
 
 ```text
-docs/model-recipes/glm-5.2.md               # Model recipe / card (pointer to this README)
-docs/tutorials/tutorial-glm-5.2.md          # Deployment tutorial (pointer to this README)
-examples/vllm_neuron/models/glm_5_2/run.py  # Offline generation example (TP=64, ep_degree=16)
+docs/model-recipes/glm-5.3.md               # Model recipe / card (pointer to this README)
+docs/tutorials/tutorial-glm-5.3.md          # Deployment tutorial (pointer to this README)
+examples/vllm_neuron/models/glm_moe_dsa/run.py  # Offline generation example (TP=64, ep_degree=16)
 ```
 
 **Modified — shared framework touch-points**
 
 ```text
 vllm_neuron/model/registry.py                   # Register GlmMoeDsaForCausalLM (served) and
-                                                #   Glm52MtpForCausalLM (unsupported path)
-vllm_neuron/model/__init__.py                   # Add glm_5_2 to the lazy-import allow-list in
+                                                #   GlmMoeDsaMtpForCausalLM (unsupported path)
+vllm_neuron/model/__init__.py                   # Add glm_moe_dsa to the lazy-import allow-list in
                                                 #   __getattr__, so the package is only imported
                                                 #   when this model is actually requested
 vllm_neuron/model/kv_cache.py                   # Add the is_mla flag to LayerSpec (keys the

@@ -1,14 +1,14 @@
-"""NKI dispatch for the GLM-5.2 MLA inner attention block (Phase 5a-ii).
+"""NKI dispatch for the GLM MLA inner attention block (Phase 5a-ii).
 
-Wraps `mla_block_kernel.glm52_mla_block_kernel` in the same way the framework wraps
+Wraps `mla_block_kernel.glm_mla_block_kernel` in the same way the framework wraps
 its own NKI kernels (`nki.jit()` -> `wrap_nki` -> `wrapped[lnc](...)`, cf.
 `vllm_neuron/functional/attention/attention_segmented_cte.py`), and gates it on
 `can_run_kernel` so CPU mode falls back to torch.
 
-🔴 **Opt-in, default OFF.** Set `GLM52_MLA_BLOCK_KERNEL=1` to enable.
+🔴 **Opt-in, default OFF.** Set `VLLM_GLM_MLA_BLOCK_KERNEL=1` to enable.
 
 Validated on the NKI CPU simulator against the torch path it replaces. Every figure is
-reproduced by `equiv_glm_5_2/tests/test_08_mla_block_kernel_agreement.py`, which is the
+reproduced by `equiv_glm_moe_dsa/tests/test_08_mla_block_kernel_agreement.py`, which is the
 source of these numbers rather than a transcription of them:
 
 | stage | fp32 | **bf16 (production)** |
@@ -36,7 +36,7 @@ provenance, not about that number being fabricated.
 ⚠️ Reproducing these needs BOTH `VLLM_NEURON_CPU_MODE=1` and `NKI_SIMULATOR=1`:
 `can_run_kernel` only consults `NKI_SIMULATOR` inside its `VLLM_NEURON_CPU_MODE` branch,
 so `NKI_SIMULATOR` alone leaves the gate shut and any "agreement" measured that way is
-torch against torch. Plus `GLM52_MLA_BLOCK_KERNEL=1` for the flag below.
+torch against torch. Plus `VLLM_GLM_MLA_BLOCK_KERNEL=1` for the flag below.
 
 It has **not** been run on device, which is why it is not the default: that would
 put an unexercised path in front of every request.
@@ -53,7 +53,7 @@ try:  # the wrapper machinery only exists on a Neuron-enabled install
     import nki
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-    from .mla_block_kernel import glm52_mla_block_kernel as _raw_kernel
+    from .mla_block_kernel import glm_mla_block_kernel as _raw_kernel
 
     _JIT = nki.jit()(_raw_kernel)
     _WRAPPED = wrap_nki(_JIT)
@@ -68,7 +68,7 @@ MASK_NEG = -30000.0
 
 
 def kernel_enabled() -> bool:
-    return os.environ.get("GLM52_MLA_BLOCK_KERNEL", "") in ("1", "true", "True")
+    return os.environ.get("VLLM_GLM_MLA_BLOCK_KERNEL", "") in ("1", "true", "True")
 
 
 def _shape_ok(Sq: int, L: int, R: int) -> bool:
