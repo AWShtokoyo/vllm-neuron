@@ -305,12 +305,22 @@ def _resize_block_len(
     if block_len <= 0:
         return block_len
 
-    lnc = 2
-    batch_sharded = (bs % lnc == 0) and (
-        bs * q_head * s_active >= P_MAX or s_prior <= 2 * P_MAX
-    )
-    sprior_sharded = (not batch_sharded) and s_prior >= lnc * P_MAX
-    sprior_n_prgs = lnc if sprior_sharded else 1
+    # Mirror gen_attention_decode_mask's lnc pick (above): lnc=2 only when
+    # s_prior is divisible by 2*P_MAX, else lnc=1 (no LNC sharding -> n_prgs 1).
+    # A hardcoded lnc=2 here computes the wrong sprior_n_prgs for any s_prior
+    # that is a multiple of P_MAX but not 2*P_MAX (e.g. block_size=896 = 7*128):
+    # the resize is skipped, block_len stays oversized, and the downstream
+    # un-shuffle reshape in _torch_attention_decode_impl gets an invalid
+    # (non-permutation) index layout and throws.
+    lnc = 2 if s_prior % (2 * P_MAX) == 0 else 1
+    if lnc == 2:
+        batch_sharded = (bs % lnc == 0) and (
+            bs * q_head * s_active >= P_MAX or s_prior <= 2 * P_MAX
+        )
+        sprior_sharded = (not batch_sharded) and s_prior >= lnc * P_MAX
+        sprior_n_prgs = lnc if sprior_sharded else 1
+    else:
+        sprior_n_prgs = 1
 
     num_blocks_per_batch = s_prior // block_len
     bucket_len = num_blocks_per_batch * block_len

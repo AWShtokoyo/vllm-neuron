@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -826,6 +827,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.kv_connector_output: KVConnectorOutput | None = None
         # Full (2, ...) KV cache tensors for DI connector registration
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
+
+        # T2 APC (mamba prefix caching, align mode): per-request tracking of
+        # which paged mamba BLOCK holds the running state, plus the paged
+        # slab-view copy state. Populated at cache-init time ONLY under APC;
+        # left None (and untouched) when prefix caching is off so the runner
+        # stays byte-identical to the non-APC path.
+        self.mamba_state_idx: dict[str, int] = {}
+        self._neuron_mamba_copy_state = None
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -2738,6 +2747,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_scheduled_tokens_padded = np.array(tokens, dtype=np.int64)
         total_num_scheduled_tokens_padded = int(num_scheduled_tokens_padded.sum())
         max_num_scheduled_tokens_padded = max(tokens)
+        # RAW (unpadded) per-request scheduled count — MUST feed the APC align running-block gather
+        # so it matches preprocess_mamba_neuron (which uses raw num_scheduled_tokens). Padded count
+        # can straddle a mamba-block boundary the raw count does not -> gather and copy planner point
+        # at different blocks -> stale/mis-slotted GDN state. See _build_attention_metadata.
+        num_scheduled_tokens_raw = np.array(
+            [scheduler_output.num_scheduled_tokens[r] for r in req_ids], dtype=np.int64)
         draft_tokens = (
             [0]
             if not scheduler_output.scheduled_spec_decode_tokens
@@ -2917,6 +2932,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            num_scheduled_tokens_padded=num_scheduled_tokens_padded,
+            num_scheduled_tokens_raw=num_scheduled_tokens_raw,
         )
 
         # Spec decoding
@@ -4081,6 +4098,52 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ctx_for_blocks = ctx_bucket if ctx_bucket is not None else self.max_model_len
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
+    @staticmethod
+    def _align_gather_col(block_table: torch.Tensor, seq_lens: torch.Tensor,
+                          block_size: int) -> torch.Tensor:
+        """Faithful port of upstream ``mamba_get_block_table_tensor`` (align) column 0:
+        gather the block holding the state at position seq_lens-1, i.e.
+        ``block_table[i, (seq_lens[i]-1)//block_size]`` (clamped to [0, num_blocks-1]).
+
+        SINGLE source of truth for the align running/seed slot so the runtime builder and
+        the warmup builder trace the IDENTICAL ``block_table.gather(1, col)`` op — a
+        mismatch here (e.g. warmup using index_select([0])) compiles then reads the wrong
+        mamba slot at runtime. seq_lens is [B] long on the block_table's device.
+
+        Args:
+            block_table: [B, num_blocks] long.
+            seq_lens: [B] long — the token count whose last-token block we want
+                (running block: num_computed+num_scheduled; seed block: num_computed).
+            block_size: mamba block size.
+        Returns: [B] long — the gathered physical block ids.
+        """
+        maxcol = block_table.shape[1] - 1
+        want = torch.clamp((seq_lens - 1) // block_size, min=0)
+        # FAIL-LOUD (batch>1 deep-block bug, 2026-07-10): if the wanted running-block column exceeds
+        # the block_table width, the clamp below SILENTLY reads the WRONG block -> the GDN state
+        # gather/scatter mis-slots -> intermittent RT-level crash mid-serve (no Python trace). This
+        # only bites when a sequence reaches a block index beyond the decode-ctx bucket width the
+        # block_table was trimmed to (_decode_ctx_blocks_from_max_decode_ctx_len) — e.g. seq>~768
+        # (block 3+) at max_model_len>=1280. The 5-shot/896 envelope (block<=2) never triggers it.
+        # Warn (host-side, does not perturb the graph) so the mis-slot is observable instead of a
+        # silent wrong-block read; the real fix is to size the mamba block_table to the full running
+        # block count.
+        # The diagnostic below forces a host-side materialization (.item()/.tolist()), which is
+        # ILLEGAL on meta tensors — during warmup/trace the block_table is on the meta device
+        # (model built on meta before weight load). Skip the check there: it's a pure host-side
+        # WARNING that does not perturb the traced graph, and there is no runtime state to mis-slot
+        # during warmup anyway. Only run it on materialized (real-device) tensors at runtime.
+        if block_table.device.type != "meta" and bool((want > maxcol).any()):
+            logger.warning(
+                "_align_gather_col: wanted running-block col %s exceeds block_table width %d "
+                "(seq_lens=%s, block_size=%d) — clamping SILENTLY reads the wrong GDN state block "
+                "(mis-slot). This is the batch>1 deep-block case: a sequence whose running state "
+                "block sits beyond the decode-context bucket width.",
+                want.tolist(), maxcol + 1, seq_lens.tolist(), block_size,
+            )
+        col = want.clamp(max=maxcol)
+        return block_table.gather(1, col.unsqueeze(1).to(block_table.device)).reshape(-1)
+
     def _build_attention_metadata(
         self,
         padded_num_reqs: int,
@@ -4089,6 +4152,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        num_scheduled_tokens_padded: "np.ndarray | None" = None,
+        num_scheduled_tokens_raw: "np.ndarray | None" = None,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -4251,6 +4316,116 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            # Hybrid (MambaSpec) state-slot routing: block_size=1 => one state row per sequence, so
+            # the per-request state slot is block_table[:,0]. GDN decode consumes this via a one-hot
+            # matmul gather/scatter (Option 5, model.py forward_decode) — NOT a raw index slice (which
+            # neuronx-cc rejects as non-contiguous). int32 native dtype; .long() only at one_hot.
+            # Emitted in BOTH builders so the key's presence matches warmup-trace vs runtime
+            # (else torch.compile fail_on_recompile).
+            if isinstance(spec, MambaSpec):
+                # index_select(dim=1, [0]): block_table[:, 0] is a STRIDED column slice of a
+                # [B, num_blocks] device tensor — that strided view entering the compiled decode graph
+                # was the root cause of the Option-1 AND Option-5 "non-contiguous slicing for Device
+                # Tensor" warmup failures (the contiguous baseline never emitted state_indices).
+                # index_select always allocates a FRESH row-major [B,1] tensor → reshape to [B].
+                _col0 = torch.zeros(1, dtype=torch.long, device=blk_table_tensor.device)
+                if not self._mamba_apc_enabled():
+                    # Non-APC: single-slot state at block_table[:,0].
+                    _state_idx = torch.index_select(blk_table_tensor, 1, _col0).reshape(-1)
+                    attn_metadata_i["state_indices"] = _state_idx
+                    # CROSS-CHUNK CARRY WITHOUT APC. The model seeds the GatedDeltaNet recurrent and
+                    # conv state from this same slot when has_initial_state says the request already
+                    # has computed tokens, i.e. this is a continuation chunk. Matches upstream CUDA,
+                    # which derives it from num_computed_tokens alone with no prefix-caching
+                    # involvement (vllm/v1/attention/backends/mamba_attn.py:
+                    # has_initial_states_p = num_computed_tokens[...] > 0). Emitting zeros here
+                    # reproduces the previous behaviour exactly, which is the fallback below.
+                    _nct_np = self.input_batch.num_computed_tokens_cpu[:padded_num_reqs]
+                    _has_init_np = (_nct_np > 0).astype(np.int32)
+                    # SAFETY: the model consumes row 0 (prefill is batch-1 on this backend). If more
+                    # than one request were prefilling in a step, rows 1..B-1 would be seeded from
+                    # row 0's slot, so fall back to no seeding -- byte-identical to the old path --
+                    # rather than seed the wrong state.
+                    _nsrc = (num_scheduled_tokens_raw if num_scheduled_tokens_raw is not None
+                             else num_scheduled_tokens_padded)
+                    if _nsrc is not None:
+                        _npref = int((np.asarray(_nsrc)[:padded_num_reqs] > 1).sum())
+                        if _npref > 1:
+                            logger.warning(
+                                "GDN cross-chunk seed disabled this step: %d requests are prefilling "
+                                "but the seed consumes row 0 only. Falling back to zero-initialised "
+                                "chunk state (pre-fix behaviour).", _npref)
+                            _has_init_np = np.zeros(padded_num_reqs, dtype=np.int32)
+                    # explicit-dtype move: a combined .to(dtype, device) trips Neuron's copy dtype
+                    # guard (see the APC branch), so cast on host then move.
+                    attn_metadata_i["has_initial_state"] = torch.from_numpy(
+                        _has_init_np).to(self.device)
+                else:
+                    # ---- FAITHFUL ALIGN (upstream mamba_get_block_table_tensor + gdn_attn) ----
+                    # Upstream align does NOT use physical block 0. It GATHERS the last-computed
+                    # block: start = (seq_lens-1)//block_size, and the forward reads/writes the
+                    # running recurrent+conv state at THAT gathered block (a single index for BOTH
+                    # read and write). The running block FLOATS with the sequence; block 0 and every
+                    # completed full block are thus free to retain their frozen boundary state for a
+                    # later cache-hit consumer, and preprocess_mamba (curr_state_idx un-pinned to
+                    # num_blocks-1-num_spec) copies the running state old->new block in LOCKSTEP when a
+                    # step crosses a boundary. The earlier "slot-jump hang" came from moving this slot
+                    # per step WITHOUT that lockstep copy; with preprocess_mamba doing the copy, the
+                    # move is safe (and is exactly upstream align). seq_lens = num_computed + scheduled.
+                    _bs = int(spec.block_size)
+                    _nct_cpu = torch.from_numpy(
+                        self.input_batch.num_computed_tokens_cpu[:padded_num_reqs]
+                    ).to(torch.long)                          # [B] cached/context len
+                    # per-request scheduled tokens for the running-block gather. MUST be the RAW
+                    # (unpadded) count so the gather block == preprocess_mamba_neuron's curr_state_idx
+                    # (which uses raw num_scheduled_tokens). Padded count can straddle a 256 boundary
+                    # the raw count does not -> gather and copy planner mis-slot the GDN state (audit
+                    # Finding #2). Fall back to padded, then 0, only if raw is unavailable.
+                    _nsched_src = (num_scheduled_tokens_raw if num_scheduled_tokens_raw is not None
+                                   else num_scheduled_tokens_padded)
+                    if _nsched_src is not None:
+                        # raw array is len(req_ids); pad to padded_num_reqs with 0 (padding rows
+                        # schedule no real tokens) so it aligns with _nct_cpu[:padded_num_reqs].
+                        _ns = np.zeros(padded_num_reqs, dtype=np.int64)
+                        _n = min(len(_nsched_src), padded_num_reqs)
+                        _ns[:_n] = np.asarray(_nsched_src)[:_n]
+                        _nsched_cpu = torch.from_numpy(_ns).to(torch.long)   # [B] RAW scheduled
+                    else:
+                        _nsched_cpu = torch.zeros_like(_nct_cpu)
+                    # GUARD: the running-block gather column MUST equal the column
+                    # preprocess_mamba_neuron uses (raw). If a padded count ever straddles a boundary
+                    # the raw count doesn't, they'd point at different blocks -> silent mis-slot.
+                    if num_scheduled_tokens_padded is not None and num_scheduled_tokens_raw is not None:
+                        _pad = np.zeros(padded_num_reqs, dtype=np.int64)
+                        _m = min(len(num_scheduled_tokens_padded), padded_num_reqs)
+                        _pad[:_m] = np.asarray(num_scheduled_tokens_padded)[:_m]
+                        _col_raw = np.clip((_nct_cpu.numpy() + _ns - 1) // _bs, 0, None)
+                        _col_pad = np.clip((_nct_cpu.numpy() + _pad - 1) // _bs, 0, None)
+                        if not (_col_raw == _col_pad).all():
+                            logger.warning(
+                                "APC running-block col mismatch raw=%s pad=%s (nct=%s) — using RAW "
+                                "(matches preprocess_mamba); padded would mis-slot GDN state.",
+                                _col_raw.tolist(), _col_pad.tolist(), _nct_cpu.tolist())
+                    # state_indices = align running block = gather at seq_lens=num_computed+scheduled
+                    # (single index, read AND write). Shared helper == the warmup builder's op.
+                    # DEEP-BLOCK FIX (batch>1): gather from the FULL
+                    # (untrimmed) block_table, NOT blk_table_tensor which may be trimmed to the
+                    # decode-ctx / SWA bucket. A seq whose running block (num_computed+scheduled) sits
+                    # beyond the trimmed width would be SILENTLY clamped to the wrong block -> GDN
+                    # state .ap mis-slot -> intermittent RT crash (seen at seq>~768 / block>=3,
+                    # 8-shot/maxlen1280). The full table always contains the real running block; this
+                    # is index-only (points at blocks ALREADY allocated in the pool) -> zero extra HBM.
+                    attn_metadata_i["state_indices"] = self._align_gather_col(
+                        full_blk_table_tensor, _nct_cpu + _nsched_cpu, _bs)
+                    # SEED index (prefill cache-hit): last-COMPUTED block = gather at num_computed
+                    # (before this step). Fresh (num_computed=0) -> col 0, masked to zeros by has_init.
+                    attn_metadata_i["seed_state_indices"] = self._align_gather_col(
+                        full_blk_table_tensor, _nct_cpu, _bs)
+                    # has_initial_state: cached tokens > 0 (host-compute, explicit-dtype move — a
+                    # combined .to(dtype,device) casts bool->int32 during copy and trips Neuron's
+                    # copy dtype guard; split the cast from the move).
+                    _has_init = (_nct_cpu > 0).to(torch.int32).to(self.device)
+                    attn_metadata_i["has_initial_state"] = _has_init
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -4428,6 +4603,57 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            # Hybrid (MambaSpec) state-slot routing — MUST mirror the runtime builder
+            # (_build_attention_metadata) so the state_indices key is PRESENT in both the warmup
+            # trace and runtime; a presence mismatch trips torch.compile fail_on_recompile.
+            # block_size=1 => state slot is block_table[:,0]. Consumed by Option-5 one-hot matmul.
+            if isinstance(spec, MambaSpec):
+                _col0 = torch.zeros(1, dtype=torch.long, device=block_table_tensor.device)
+                if not self._mamba_apc_enabled():
+                    # Non-APC: single-slot state at block_table[:,0]. index_select(dim=1,[0]) gives a
+                    # FRESH row-major [B] tensor so a strided column view never enters the graph.
+                    attn_metadata_i["state_indices"] = torch.index_select(
+                        block_table_tensor, 1, _col0).reshape(-1)
+                    # has_initial_state MUST be present here too: the runtime builder now emits it on
+                    # this path, and a key-presence mismatch between warmup and runtime trips
+                    # torch.compile fail_on_recompile. Warmup traces a synthetic FRESH request, so
+                    # zeros -- same value the APC branch uses below.
+                    attn_metadata_i["has_initial_state"] = torch.zeros(
+                        block_table_tensor.shape[0], dtype=torch.int32,
+                        device=block_table_tensor.device)
+                else:
+                    # FAITHFUL ALIGN: warmup MUST trace the SAME align gather op as the runtime
+                    # builder (via the shared _align_gather_col helper), NOT index_select([0]) —
+                    # else the warmup-compiled graph reads a different mamba slot than runtime feeds
+                    # (silent wrong-slot or a first-APC-step recompile under fail_on_recompile).
+                    # Warmup is a synthetic FRESH request: num_computed = cached_seq_len, seq_lens
+                    # (running) = cached_seq_len + num_tokens (>=1).
+                    _bs = int(spec.block_size)
+                    _B = block_table_tensor.shape[0]
+                    _dev = block_table_tensor.device
+                    _run_seq = torch.full((_B,), max(1, int(cached_seq_len) + int(num_tokens)),
+                                          dtype=torch.long, device=_dev)
+                    _seed_seq = torch.full((_B,), int(cached_seq_len),
+                                           dtype=torch.long, device=_dev)
+                    # DEEP-BLOCK FIX (mirror runtime): gather from the FULL block_table so warmup
+                    # traces the identical op the runtime builder now uses (full, not trimmed) —
+                    # else a shape/width mismatch would trip fail_on_recompile. See §16.
+                    attn_metadata_i["state_indices"] = self._align_gather_col(
+                        full_block_table_tensor, _run_seq, _bs)
+                    attn_metadata_i["seed_state_indices"] = self._align_gather_col(
+                        full_block_table_tensor, _seed_seq, _bs)
+                    attn_metadata_i["has_initial_state"] = torch.zeros(
+                        _B, dtype=torch.int32, device=_dev)
+                    # IN-GRAPH carry-forward: trace the block->block .ap copy at warmup
+                    # with an all -1 (skip) plan. Shape [_B,1] == the SAME per-graph batch dim as
+                    # state_indices (Dynamo guards the row count against the graph's batch; a fixed
+                    # max_num_reqs mismatches the prefill graph -> fail_on_recompile). Runtime pads
+                    # its real (src,dst) vectors to this same _B.
+                    if os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1":
+                        attn_metadata_i["carry_src_ids"] = torch.full(
+                            (_B, 1), -1, dtype=torch.int32, device=_dev)
+                        attn_metadata_i["carry_dst_ids"] = torch.full(
+                            (_B, 1), -1, dtype=torch.int32, device=_dev)
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -5290,6 +5516,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._validate_token_ids(input_ids)
         return input_ids
 
+    def _mamba_apc_enabled(self) -> bool:
+        """T2 APC gate: True only when cross-request mamba prefix caching is on
+        (enable_prefix_caching or mamba_cache_mode=='align'). ALL new APC
+        behavior is gated on this; when False the runner is byte-identical to
+        the validated non-APC path."""
+        cc = self.vllm_config.cache_config
+        return bool(getattr(cc, "enable_prefix_caching", False)) or (
+            getattr(cc, "mamba_cache_mode", "none") == "align"
+        )
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -5658,6 +5894,77 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "Disable async scheduling with: --no-async-scheduling"
                 )
 
+        # T2 APC (align mode): BEFORE the forward, copy each request's previous
+        # running mamba state to the block that will hold this step's state
+        # (prev_block -> curr_block on a cache-extended prefix). Faithful port of
+        # upstream preprocess_mamba bookkeeping; the block->block copy runs as an
+        # index_copy_ on the paged slab views (Triton batch_memcpy is not on
+        # Neuron). Strictly APC-gated -> non-APC path is byte-identical.
+        if (
+            self._mamba_apc_enabled()
+            and self._neuron_mamba_copy_state is not None
+        ):
+            # IN-GRAPH carry-forward: resolve the prev->curr block-id vectors
+            # (upstream preprocess_mamba bookkeeping) and inject them into attn_metadata so the
+            # GDN forward does the copy via the .ap gather/scatter (one dispatch/layer) — instead
+            # of the eager per-row _execute_plan copy that overflowed the DMA descriptor at
+            # concurrency (dmem_copy ret=-7). For the non-unified/packed fallback (no raw_slabs),
+            # keep the legacy eager copy.
+            from vllm_neuron.vllm.worker.neuron_mamba_apc import (
+                collect_carry_forward_ids,
+                preprocess_mamba_neuron,
+            )
+            _cs = self._neuron_mamba_copy_state
+            if os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1" and _cs.raw_slabs:
+                # emit raw int32 (src,dst) block-id vectors into each GDN layer's metadata;
+                # the model forward anchors + consumes them via .ap gather/scatter. -1 = skip.
+                # {gid: (src_list, dst_list)} | None — the shared BlockPool hands each recurrent
+                # group DISJOINT block ids, so a layer MUST use its OWN group's pair (using group
+                # 0's ids for all layers left groups 1..N-1 unmigrated -> silent state reset;
+                # see CARRY_FORWARD_GROUP_BUG).
+                _cf = collect_carry_forward_ids(
+                    scheduler_output, self.mamba_state_idx, self.input_batch,
+                    self.requests, _cs,
+                )
+                # ALWAYS inject the keys (all -1 when no carry) so the key is PRESENT on EVERY
+                # invocation, and size the row count to the SAME per-layer batch dim as
+                # state_indices (the graph guards carry row-count against its batch; a fixed
+                # max_num_reqs mismatches the prefill graph -> fail_on_recompile). Pad the real
+                # (src,dst) pairs to that length with -1 (skip). Injected BY GROUP MEMBERSHIP:
+                # all layers of a group share ONE metadata dict object, so writing via any of the
+                # group's layer_names updates every layer in that group.
+                if attn_metadata is not None:
+                    for gid in _cs.mamba_group_ids:
+                        _grp = self.kv_cache_config.kv_cache_groups[gid]
+                        _md = attn_metadata.get(_grp.layer_names[0])
+                        if not isinstance(_md, dict):
+                            continue
+                        _si = _md.get("state_indices")
+                        _n = int(_si.shape[0]) if _si is not None else int(self.max_num_reqs)
+                        _src = torch.full((_n, 1), -1, dtype=torch.int32, device=self.device)
+                        _dst = torch.full((_n, 1), -1, dtype=torch.int32, device=self.device)
+                        _pair = (_cf or {}).get(gid)
+                        if _pair is not None:
+                            _k = min(len(_pair[0]), _n)
+                            if _k > 0:
+                                _src[:_k, 0] = torch.tensor(_pair[0][:_k], dtype=torch.int32, device=self.device)
+                                _dst[:_k, 0] = torch.tensor(_pair[1][:_k], dtype=torch.int32, device=self.device)
+                        for _ln in _grp.layer_names:
+                            _mdl = attn_metadata.get(_ln)
+                            if isinstance(_mdl, dict):
+                                _mdl["carry_src_ids"] = _src
+                                _mdl["carry_dst_ids"] = _dst
+            else:
+                preprocess_mamba_neuron(
+                    scheduler_output,
+                    self.kv_cache_config,
+                    self.vllm_config.cache_config,
+                    self.mamba_state_idx,
+                    self.input_batch,
+                    self.requests,
+                    self._neuron_mamba_copy_state,
+                )
+
         # Wrap with set_forward_context for DI support
         with (
             set_forward_context(
@@ -5681,6 +5988,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 logit_mask=logit_mask,
                 rotary_position_ids=rotary_position_ids,
                 mm_kwargs=mm_kwargs,
+            )
+
+        # T2 APC (align mode): AFTER the forward, persist the running mamba
+        # state at each completed block boundary into the shared full block so a
+        # later cache-hit request that shares the block reads it (GAP-3). Runs
+        # here (not in sample_tokens) so it uses this step's freshly-written
+        # recurrent/conv state. Faithful port of upstream postprocess_mamba.
+        if (
+            self._mamba_apc_enabled()
+            and self._neuron_mamba_copy_state is not None
+        ):
+            from vllm_neuron.vllm.worker.neuron_mamba_apc import (
+                postprocess_mamba_neuron,
+            )
+            postprocess_mamba_neuron(
+                scheduler_output,
+                self.kv_cache_config,
+                self.input_batch,
+                self.requests,
+                self.mamba_state_idx,
+                self._neuron_mamba_copy_state,
             )
 
         # Store the last-accepted token from the rejection sampler (spec
@@ -8521,6 +8849,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Build KV caches per group
         kv_caches = {}
+        _gdn_raw_meta = {}  # layer -> [(raw_slab_dtype_view, elem_off, comp_elems), ...] (unified)
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
 
@@ -8549,19 +8878,104 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     )
 
                     kv_shape = (2, num_blocks, num_kv_heads, block_size, head_size)
-                    typed_tensor = _shared_dtype_view(
-                        raw_tensor, kv_cache_spec.dtype
-                    ).view(kv_shape)
-                    # K and V are backed by the same (2, ...) storage; only
-                    # the K slice is reshaped to the packed layout when FP8
-                    # packing is enabled (same numel, different view).
-                    k_cache = typed_tensor[0]
-                    if k_is_packed:
-                        k_cache = k_cache.view(k_cache_shape)
-                    kv_caches[layer_name] = [k_cache, typed_tensor[1]]
-                    # Store the full (2, ...) tensor for DI connector registration;
-                    # typed_tensor[0] and typed_tensor[1] are views into it.
-                    self._kv_cache_full_tensors[layer_name] = typed_tensor
+                    # HYBRID UNIFIED-CACHE (2026-07-08, restores upstream sharing):
+                    # upstream's "General case" grouping packs one full-attn layer AND several
+                    # GDN layers into ONE shared raw slab (KVSLAB[i] shared_by=[layers.{4i+3}.
+                    # self_attn, layers.{4i}/{4i+1}/{4i+2}.linear_attn]) — four layers from four
+                    # DISTINCT kv_cache_groups, each handed DISJOINT block ids from the one shared
+                    # BlockPool (block id k is owned by exactly one group at a time). Upstream keeps
+                    # them apart by addressing every layer as block_id x uniform_page_size: block k
+                    # lives at byte k*page for ALL specs, so disjoint ids => disjoint bytes.
+                    #
+                    # The bug the standalone-alloc hotfix papered over: the MambaSpec branch below
+                    # used to carve GDN state PACKED (block k at byte k*state_bytes) while full-attn
+                    # here is K-MAJOR (block k's K at byte k*half). Two DIFFERENT stride mappings of
+                    # the SAME (disjoint) block-id space => disjoint ids do NOT imply disjoint bytes
+                    # -> GDN block writes land inside full-attn KV bytes -> clobber -> wrong output.
+                    #
+                    # Fix (both here and the MambaSpec branch): make BOTH page-strided by the
+                    # uniform page_size, matching upstream. Full-attn becomes PAGE-CONFINED — block
+                    # k's K at page k offset 0, V at page k offset `half` — via as_strided views over
+                    # the shared slab (row-stride = one page). Because block ids are disjoint across
+                    # groups and both specs now use the SAME k*page mapping, no aliasing.
+                    # NOTE: hybrid models do not use the FP8-packed K layout (fp8_packed_kv opt-in
+                    # is for dense FP8 decode); k_is_packed is False on this path.
+                    _hybrid = any(
+                        isinstance(g.kv_cache_spec, MambaSpec)
+                        for g in kv_cache_config.kv_cache_groups
+                    )
+                    # UNIFIED-CACHE gate: the page-strided shared-slab layout is ONLY valid with
+                    # the .ap gather (VLLM_UNIFIED_KV_GATHER=1) in model.py — the default torch
+                    # k_src[flat_idx] gather does NOT lower on a strided view. So page-stride ONLY
+                    # when the flag is set; otherwise keep the standalone-alloc hotfix (byte-
+                    # identical, device-validated by B2). Carve gate == model gather gate.
+                    _unified = os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1"
+                    if _hybrid and _unified:
+                        _elem = torch.empty(
+                            0, dtype=kv_cache_spec.dtype
+                        ).element_size()
+                        _page_bytes = kv_cache_spec.page_size_bytes
+                        assert _page_bytes % _elem == 0, (
+                            f"page_size_bytes {_page_bytes} not aligned to dtype "
+                            f"elem {_elem}"
+                        )
+                        _page_stride = _page_bytes // _elem  # per-block stride (elems)
+                        _half = num_kv_heads * block_size * head_size  # K elems (== V)
+                        assert 2 * _half <= _page_stride, (
+                            f"K+V ({2 * _half} elems) must fit one page "
+                            f"({_page_stride} elems)"
+                        )
+                        _base = raw_tensor.view(kv_cache_spec.dtype)
+                        # contiguous within-block strides for (nkh, block_size, head)
+                        _inner = (block_size * head_size, head_size, 1)
+                        k_cache = _base.as_strided(
+                            (num_blocks, num_kv_heads, block_size, head_size),
+                            (_page_stride, *_inner),
+                            0,
+                        )
+                        v_cache = _base.as_strided(
+                            (num_blocks, num_kv_heads, block_size, head_size),
+                            (_page_stride, *_inner),
+                            _half,  # V starts at page offset `half`
+                        )
+                        # ALSO expose the CONTIGUOUS raw slab [num_blocks, page_stride] + K/V
+                        # column offsets. The .ap gather/write kernels take THIS (not the strided
+                        # k_cache/v_cache views) — a reshape((num_blocks, per_block)) of a strided
+                        # view is non-contiguous and device-rejected; the contiguous raw slab
+                        # reshapes free. kv_caches carries [k_view, v_view, raw_slab, k_off, v_off]
+                        # for the model's bind_kv_cache to stash on the layer.
+                        _raw_slab = _base.as_strided(
+                            (num_blocks, _page_stride), (_page_stride, 1), 0)
+                        kv_caches[layer_name] = [k_cache, v_cache, _raw_slab, 0, _half]
+                        # NOTE: page-confined K/V are two strided views of the slab; there is no
+                        # single contiguous (2, num_blocks, ...) tensor to hand the DI connector.
+                        # register_kv_caches (NIXL) assumes that shape — a separate task if a KV
+                        # transfer group is ever enabled for hybrid. B2/serve (no transfer group)
+                        # falls back to kv_caches[layer]=[k,v] via get_kv_cache_view..., so we
+                        # deliberately do NOT populate _kv_cache_full_tensors here.
+                    elif _hybrid:
+                        # hybrid WITHOUT unified flag: standalone-alloc HOTFIX (commit
+                        # 96662700b) — full-attn K/V gets its OWN storage so it does not alias
+                        # the GDN state slab (the block256 overlap bug). Device-validated by B2.
+                        typed_tensor = torch.zeros(
+                            kv_shape, dtype=kv_cache_spec.dtype, device=raw_tensor.device
+                        )
+                        kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]
+                        self._kv_cache_full_tensors[layer_name] = typed_tensor
+                    else:
+                        typed_tensor = _shared_dtype_view(
+                            raw_tensor, kv_cache_spec.dtype
+                        ).view(kv_shape)
+                        # K and V are backed by the same (2, ...) storage; only
+                        # the K slice is reshaped to the packed layout when FP8
+                        # packing is enabled (same numel, different view).
+                        k_cache = typed_tensor[0]
+                        if k_is_packed:
+                            k_cache = k_cache.view(k_cache_shape)
+                        kv_caches[layer_name] = [k_cache, typed_tensor[1]]
+                        # Store the full (2, ...) tensor for DI connector registration;
+                        # typed_tensor[0] and typed_tensor[1] are views into it.
+                        self._kv_cache_full_tensors[layer_name] = typed_tensor
 
             # Spec decoding specifically use this because hidden_size of different layers
             # (draft and target model) are different.
@@ -8595,6 +9009,94 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            elif isinstance(kv_cache_spec, MambaSpec):
+                # Hybrid model: stateful layers (Mamba, GatedDeltaNet, etc.)
+                # UNIFIED PAGED MAMBA CACHE (2026-07-08, page-strided — restores upstream sharing):
+                # carve each state component as a PAGE-STRIDED view of the shared slab so GDN block k
+                # lives at byte k*page_size_bytes — the SAME block_id x page mapping full-attn uses
+                # (see the FullAttentionSpec branch above). Within page k, GDN state sits AFTER the
+                # full-attn K+V region (byte offset 2*half within the page); components (conv, then
+                # recurrent) are packed back-to-back within that tail. Because the shared BlockPool
+                # hands full-attn and GDN DISJOINT block ids (block k owned by one group at a time)
+                # and BOTH specs now stride by the same page, disjoint ids => disjoint bytes: no
+                # overlap, no clobber. This replaces the old PACKED-from-0 carve (block k at byte
+                # k*state_bytes) which used a different stride than full-attn and thus aliased.
+                #
+                # READ/WRITE INDEXING (the correctness crux): state_indices carry REAL pool block
+                # ids in [0, num_blocks) (from _align_gather_col -> block_table.gather). The one-hot
+                # gather/scatter (_gather_rows/_scatter_rows in model.py) index state.reshape(N,-1)
+                # by LOGICAL row k; as_strided maps logical row k -> physical page k, so reshape
+                # preserves row order and BOTH reads and writes address the correct page regardless
+                # of the physical stride. No model-side change needed. The one-hot matmul never takes
+                # an in-place strided-slice write (which Neuron rejects) — it reads via reshape and
+                # writes the full tensor back through copy_, so the strided view lowers.
+                import math as _m
+                _unified = os.environ.get("VLLM_UNIFIED_KV_GATHER") == "1"
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_bytes = kv_cache_spec.page_size_bytes
+                    n_blocks = raw_tensor.numel() // page_bytes
+                    raw_i8 = raw_tensor.view(torch.int8)
+                    state_tensors = []
+                    if _unified:
+                        # UNIFIED-CACHE: GDN state PAGE-STRIDED — block k at byte k*page_bytes,
+                        # offset 0 in the page (SAME block_id x page mapping full-attn uses). Disjoint
+                        # block ids (shared BlockPool, block k owned by one group at a time) => full-
+                        # attn KV and GDN state never co-reside in a page. This is the shared-slab
+                        # layout; requires VLLM_UNIFIED_KV_GATHER path (staged compact kernels /
+                        # one-hot, which tolerate the strided view). Components pack from page offset 0.
+                        # Also expose, per component, the CONTIGUOUS raw slab reshaped in that
+                        # component's dtype [n_blocks, page_elems_dtype] + the component's element
+                        # offset within the page. The .ap gather/scatter kernels take THESE (not the
+                        # strided as_strided comp views): reshape((n_blocks, comp_elems)) of a strided
+                        # view is non-contiguous and device-rejected; the contiguous dtype-viewed raw
+                        # slab reshapes free. Components have DIFFERENT dtypes (conv bf16, recurrent
+                        # fp32) so each gets its own dtype-viewed slab + elem offset. Carried as
+                        # state_tensors[i] = (strided_view, raw_slab_dtype, elem_off) tuples.
+                        comp_off = 0  # byte offset within page
+                        _raw_meta = []
+                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                            dsz = torch.empty(0, dtype=dtype).element_size()
+                            comp_elems = _m.prod(shape)
+                            assert comp_off + comp_elems * dsz <= page_bytes, (
+                                f"GDN component ({comp_elems * dsz} B at page offset "
+                                f"{comp_off}) overflows page ({page_bytes} B)"
+                            )
+                            assert page_bytes % dsz == 0 and comp_off % dsz == 0, (
+                                "page/offset must align to component dtype"
+                            )
+                            _typed = raw_i8.view(dtype)
+                            _inner_strides = []
+                            _acc = 1
+                            for d in reversed(shape):
+                                _inner_strides.insert(0, _acc)
+                                _acc *= d
+                            comp = _typed.as_strided(
+                                (n_blocks, *shape),
+                                (page_bytes // dsz, *_inner_strides),
+                                comp_off // dsz,
+                            )
+                            state_tensors.append(comp)
+                            # per-component contiguous raw slab [n_blocks, page_elems_dtype] + elem off
+                            _page_elems = page_bytes // dsz
+                            _raw_dtype = _typed.as_strided((n_blocks, _page_elems), (_page_elems, 1), 0)
+                            _raw_meta.append((_raw_dtype, comp_off // dsz, comp_elems))
+                            comp_off += comp_elems * dsz
+                        # stash raw-slab metadata alongside the state tensors for bind_mamba_state
+                        _gdn_raw_meta[layer_name] = _raw_meta
+                    else:
+                        # DEFAULT (shipping): CONTIGUOUS PACKED carve from byte 0 — the layout the
+                        # current slot NKI kernels (gdn_state_update/conv_update) address via
+                        # slot*head_elems. conv+recurrent back-to-back, no page-interleave stride.
+                        off = 0
+                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                            dsz = torch.empty(0, dtype=dtype).element_size()
+                            nbytes = n_blocks * _m.prod(shape) * dsz
+                            comp = raw_i8[off:off + nbytes].view(dtype).view(n_blocks, *shape)
+                            state_tensors.append(comp)
+                            off += nbytes
+                    kv_caches[layer_name] = state_tensors
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -8602,6 +9104,68 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
+
+        # Hybrid models (e.g. Qwen3.5 Gated DeltaNet): bind the framework-allocated
+        # recurrent-state tensors (the MambaSpec branch above filled kv_caches with
+        # per-rank state for the stateful/linear_attn layers) to the model. The
+        # state is owned by the runner/allocator (OPT-FULL lifecycle), sized by the
+        # model's per-rank get_mamba_state_shape_from_config.
+        if hasattr(self.model, "bind_mamba_state"):
+            # Pass the per-component raw-slab metadata (unified path) so the model routes GDN state
+            # gather/scatter through the .ap kernels on the CONTIGUOUS raw slab (not the strided
+            # comp views). Empty dict on the default path -> model uses the existing contiguous/
+            # one-hot path unchanged. Stash before bind so bind_mamba_state can read it.
+            self.model._gdn_raw_meta = _gdn_raw_meta
+            self.model.bind_mamba_state(kv_caches)
+            # T2 APC: build the paged-slab copy state from the SAME kv_caches
+            # views just bound to the model (VLLM_GDN_SLAB_PACKED gives the
+            # contiguous [num_blocks,*state] layout). Only under APC/align — the
+            # copy is invoked exclusively from execute_model under the same gate,
+            # so non-APC never touches it.
+            if self._mamba_apc_enabled():
+                from vllm_neuron.vllm.worker.neuron_mamba_apc import (
+                    NeuronMambaCopyState,
+                )
+                mamba_state_tensors = {
+                    ln: kv_caches[ln]
+                    for grp in self.kv_cache_config.kv_cache_groups
+                    if isinstance(grp.kv_cache_spec, MambaSpec)
+                    for ln in grp.layer_names
+                    if ln in kv_caches
+                }
+                # Copy funcs (conv, temporal, ...) — their IDENTITY drives the
+                # per-state src-block / intra-block-offset resolution for
+                # spec-decode partial-block copies (SPEC-DECODE B2). Order
+                # matches the state_tensors per-layer order.
+                mamba_copy_funcs = ()
+                if hasattr(self.model, "get_mamba_state_copy_func"):
+                    mamba_copy_funcs = self.model.get_mamba_state_copy_func()
+                # UNIFIED-CACHE: thread the CONTIGUOUS raw slab per (layer, state_pos) so the eager
+                # block->block copy moves whole contiguous pages (RT-safe) instead of strided rows of
+                # the as_strided component view (nrt_tensor_copy status=2). _gdn_raw_meta[layer] =
+                # [(raw_slab_dtype[n_blocks,page_elems], elem_off, comp_elems), ...] per component;
+                # raw_slab_dtype is the SAME contiguous [n_blocks,page_elems] page slab for every
+                # component (row k = block k's whole page), so a whole-page copy moves all components.
+                _raw_slabs = {}
+                for _ln, _meta in _gdn_raw_meta.items():
+                    for _sp, (_raw_slab, _off, _ce) in enumerate(_meta):
+                        _raw_slabs[(_ln, _sp)] = _raw_slab
+                self._neuron_mamba_copy_state = NeuronMambaCopyState.create(
+                    self.kv_cache_config, mamba_state_tensors, mamba_copy_funcs,
+                    raw_slabs=_raw_slabs,
+                )
+                logger.info(
+                    "T2 APC: mamba copy-state built for %d layers "
+                    "(align-mode block_size=%d)",
+                    len(mamba_state_tensors),
+                    self._neuron_mamba_copy_state.mamba_spec.block_size,
+                )
+        elif hasattr(self.model, "bind_recurrent_state"):
+            # Legacy path: model self-allocates module-internal state.
+            max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
+            self.model.bind_recurrent_state(
+                batch_size=max_batch_size, device=next(self.model.parameters()).device
+            )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -8670,6 +9234,106 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             all_kv_cache_specs[layer_name] = spec
 
+        # Hybrid models: emit MambaSpec for stateful layers
+        from vllm.model_executor.models.interfaces import is_hybrid
+        if is_hybrid(self.model):
+            kv_spec = self.model.get_kv_spec()
+            if hasattr(kv_spec, 'stateful_layer_names'):
+                shapes = self.model.get_mamba_state_shape_from_config(self.vllm_config)
+                dtypes = self.model.get_mamba_state_dtype(self.vllm_config)
+                # Page-size alignment (OPT-PAD-port): the platform set
+                # cache_config.mamba_page_size_padded in update_block_size_for_backend
+                # so this MambaSpec page == the full-attn page. Thread it in.
+                mamba_page_size_padded = getattr(
+                    self.vllm_config.cache_config, 'mamba_page_size_padded', None
+                )
+                # APC (T2): under prefix caching the framework needs a PAGED
+                # mamba state (block_size>1, multiple state slots per seq indexed
+                # by position) so align-mode block indexing works. Emit the
+                # framework-computed cache_config.mamba_block_size (defaults to
+                # cache_config.block_size when APC on — models/config.py:397-398).
+                # Non-APC → block_size = max_model_len (whole seq in ONE block;
+                # required by the single-slot block_table[:,0] state read — see the
+                # inline note in the else branch below; block_size=256 was
+                # device-disproven, corrupts logits). Gate strictly on APC/align.
+                _cc = self.vllm_config.cache_config
+                _mamba_mode = getattr(_cc, 'mamba_cache_mode', 'none')
+                _apc = getattr(_cc, 'enable_prefix_caching', False) or _mamba_mode == 'align'
+                if _apc:
+                    _mbs = getattr(_cc, 'mamba_block_size', None)
+                    if _mbs is None:
+                        # Fallback: tie to the attn block, rounded to a
+                        # multiple-of-8 (conv1d granularity, cache.py:119/123).
+                        _mbs = max(8, (int(block_size) // 8) * 8)
+                    mamba_block_size = int(_mbs)
+                else:
+                    # Non-APC ('none' mode): mamba block_size = max_model_len so the WHOLE
+                    # sequence lives in ONE block. The SSM/GDN recurrent state is O(1) per
+                    # sequence (one fixed state slab); the runtime GDN state addressing reads
+                    # a SINGLE slot (block_table[:,0], guarded by _mamba_apc_enabled()) for
+                    # non-APC regardless of block_size. So the whole prefix state MUST fit
+                    # in block 0 -> block_size must span the full sequence.
+                    #
+                    # DO NOT shrink this to the upstream-aligned cache_config.block_size (256):
+                    # DEVICE-DISPROVEN 2026-07-21 — block_size=256 makes seq1024 span 4 blocks
+                    # (cdiv(1024,256)=4), but the single-slot state read only sees block 0 ->
+                    # garbage logits (seq1024-bs1-seg512 went 0.67 -> Tgt/Base 17-87x, BC ~0.2,
+                    # EVERY token divergent). The bounded-page theory ignored the runtime
+                    # single-slot gather contract. block_size=1 is the other failure mode:
+                    # cdiv(N,1)=N mamba blocks/req -> pool exhausted -> scheduler wedge (this is
+                    # the same over-admission the _pool_admission_ok() gate defends against).
+                    # max_model_len is the only value satisfying the single-slot contract.
+                    #
+                    # The long-context OOM (maxlen8192) is a SEPARATE concern solved by
+                    # --num-gpu-blocks-override (caps the KV/state block pool), NOT by
+                    # shrinking block_size (which corrupts state addressing).
+                    mamba_block_size = int(
+                        getattr(_cc, 'mamba_block_size', None) or self.max_model_len
+                    )
+                # SPEC-DECODE B3: reserve draft-token state capacity in the
+                # paged mamba pool. Upstream (mamba/abstract.py
+                # get_kv_cache_spec) sets num_speculative_blocks =
+                # num_speculative_tokens — one extra state slot per in-flight
+                # draft token so align/none-mode block indexing (mamba_utils.py
+                # curr_state_idx = num_blocks - 1 - num_speculative_blocks) and
+                # the manager's extra-block allocation land on real storage.
+                # This only scales max_memory_usage_bytes (pool block count),
+                # never page_size_bytes, so the KV-page == mamba-page assert
+                # below is unaffected. Non-spec (no speculative_config or
+                # num_speculative_tokens=0) => 0 => BYTE-IDENTICAL to today.
+                _num_spec_blocks = (
+                    self.speculative_config.num_speculative_tokens
+                    if self.speculative_config
+                    else 0
+                )
+                for layer_name in kv_spec.stateful_layer_names:
+                    all_kv_cache_specs[layer_name] = MambaSpec(
+                        block_size=mamba_block_size,
+                        shapes=shapes,
+                        dtypes=dtypes,
+                        mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode
+                        if hasattr(self.vllm_config.cache_config, 'mamba_cache_mode')
+                        else "none",
+                        page_size_padded=mamba_page_size_padded,
+                        num_speculative_blocks=_num_spec_blocks,
+                    )
+
+                # Fail fast if the platform's padded page does not match the
+                # full-attn page the loop above emitted (spec §4 reconciliation):
+                # a mismatch would otherwise surface as a cryptic unify error.
+                if mamba_page_size_padded is not None:
+                    for layer in target_kv_spec.layers:
+                        attn_spec = all_kv_cache_specs.get(layer.name)
+                        if isinstance(attn_spec, FullAttentionSpec):
+                            assert attn_spec.page_size_bytes == mamba_page_size_padded, (
+                                "Hybrid page-size mismatch: full-attn "
+                                f"{attn_spec.page_size_bytes} != padded mamba "
+                                f"{mamba_page_size_padded} for {layer.name}. "
+                                "Check per-rank attn geometry in "
+                                "Platform._align_hybrid_mamba_page (spec §4)."
+                            )
+                            break
+
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
 
@@ -8731,7 +9395,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
-        layers = getattr(getattr(model, "model", model), "layers", [])
+        # Find the decoder layers. Different wrappers nest them differently:
+        #   Qwen3_5ForConditionalGeneration -> .language_model.layers  (this hybrid model)
+        #   others -> .model.layers  or  .layers
+        layers = []
+        for _holder in (getattr(model, "language_model", None),
+                        getattr(model, "model", None), model):
+            _l = getattr(_holder, "layers", None) if _holder is not None else None
+            if _l:
+                layers = _l
+                break
 
         for i, layer in enumerate(layers):
             layer_name = f"layers.{i}.self_attn"
@@ -8743,6 +9416,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 buf = io.BytesIO()
                 torch.save({"k": k_cpu, "v": v_cpu}, buf)
                 kv_caches[layer_name] = buf.getvalue()
+            # SSM-CACHE EXTRACTION (hybrid GDN layers): the existing tool only grabbed self_attn
+            # k/v; the GDN linear_attn layers hold recurrent_state/conv_state (the SSM caches) that
+            # NO tool checked. Extract them too so an APC-on vs off A/B can diff the SSM propagation
+            # (the unverified APC path). Host-side RPC, not the compiled forward — no graph impact.
+            lin = getattr(layer, "linear_attn", None)
+            if lin is not None and (getattr(lin, "recurrent_state", None) is not None
+                                    or getattr(lin, "conv_state", None) is not None):
+                _d = {}
+                if getattr(lin, "recurrent_state", None) is not None:
+                    _d["recurrent_state"] = lin.recurrent_state.detach().cpu()
+                if getattr(lin, "conv_state", None) is not None:
+                    _d["conv_state"] = lin.conv_state.detach().cpu()
+                buf = io.BytesIO()
+                torch.save(_d, buf)
+                kv_caches[f"layers.{i}.linear_attn"] = buf.getvalue()
 
         return kv_caches
 

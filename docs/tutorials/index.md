@@ -68,6 +68,13 @@ Configure encoder-disaggregated (EPD) multimodal topologies.
 Serve embeddings via `/v1/embeddings` with a pooling model.
 :::
 
+:::{grid-item-card} Deploying Qwen3.6-35B-A3B
+:link: tutorial-qwen3-6-moe
+:link-type: doc
+
+Deploy Qwen3.6-35B-A3B (hybrid MoE, BF16 / FP8, image + video) with vLLM on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -83,4 +90,5 @@ Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmark
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
 Disaggregated encoder (1E1PD and xEyPD) <tutorial-epd-1e-1pd-xeypd>
 Deploying Qwen3-Embedding-8B <tutorial-qwen3-embedding-8b>
+Deploying Qwen3.6-35B-A3B <tutorial-qwen3-6-moe>
 :::

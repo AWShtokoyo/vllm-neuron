@@ -33,6 +33,13 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy Qwen3.6-35B-A3B
+:link: qwen3-6-moe
+:link-type: doc
+
+Model recipe for Qwen3.6-35B-A3B (hybrid MoE, BF16 / FP8, image + video) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Llama 3 <llama-3>
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
 Qwen3-Embedding <qwen3-embedding-8b>
+Qwen3.6-35B-A3B <qwen3-6-moe>
 :::
