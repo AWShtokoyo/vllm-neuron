@@ -332,18 +332,25 @@ class GlmMoeDsaMtpForCausalLM(GlmMoeDsaMtpForCausalLMBF16):
         )
 
         # Prepare moe_tkg decode weights (stack gate+up, free originals) — mirrors
-        # model_fp8_per_channel.load_weights:761-764. The stacked _tkg_gate_up_w +
-        # scales are ALSO what the einsum decode path dequantizes, so this prep is
-        # needed regardless of which decode path runs.
+        # model_fp8_per_channel.load_weights:761-764.
         if hasattr(moe, "_prepare_tkg_weights"):
             moe._prepare_tkg_weights()
-        # Route the DRAFT's decode MoE through the kernel-free einsum path. The
-        # moe_tkg NKI kernel's internal indirect DMA goes out-of-bound at the
-        # γ=1 verify token shape (T=bs*(1+γ)); the einsum path is per-token and
-        # shape-agnostic. Only the draft's layer-78 MoE is flagged; the base
-        # target model keeps the fast kernel path.
-        moe.use_einsum_decode = True
-        logger.info("MTP draft decode MoE → einsum path (moe_tkg over-read workaround)")
+        # The draft's decode MoE uses the SAME moe_tkg kernel path as the target.
+        #
+        # This used to set `moe.use_einsum_decode = True`, routing the draft through the
+        # kernel-free einsum path, because moe_tkg's internal indirect DMA over-read the
+        # affinity source at the γ=1 verify token shape (T=bs*(1+γ)). That workaround is
+        # obsolete: `_forward_decode` now pads T up to a multiple of `_DGE_ALIGNMENT`
+        # (16) *before* dispatching, which covers the base decode shape (T=bs) and the
+        # MTP verify shape alike — see model_fp8_per_channel._forward_decode.
+        #
+        # Dropping it lets the draft read only its routed experts instead of all local
+        # ones. Measured at max_model_len=2048 / segment 512 / max_num_seqs=1 / γ=1,
+        # against the same non-speculative control (11.5 tok/s in both runs):
+        # 12.22 -> 12.44 tok/s and TPOT 67.68 -> 65.88 ms. The over-read does not recur.
+        # The gain is small because decode here is not bandwidth-bound, so a ~32x
+        # reduction in the draft's MoE reads buys single-digit percent.
+        logger.info("MTP draft decode MoE → moe_tkg kernel path (padded in _forward_decode)")
 
     @classmethod
     def from_configs(

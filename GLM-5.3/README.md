@@ -13,7 +13,8 @@ Newest first. Each entry links to the section with the full detail.
 
 | Date | Change |
 |---|---|
-| 2026-09-01 | Retargeted onto **`zai-org/GLM-5.3`**, which supersedes GLM-5.2-FP8. Verified on the new weights in the same pass: **[Automatic Prefix Caching](#accuracy-evaluation) enabled and measured** (60.2 % lower median TTFT, 1.25× output throughput, at the predicted hit rate); **[`decode_context_length_buckets`](#setting-decode_context_length_buckets-cuts-decode-time-by-a-third) measured for the first time** (−36.0 % TPOT, TTFT unchanged) and now recommended; **[batching](#batching-scales-to-612-at-the-engines-maximum) measured to the engine's ceiling** (6.12× at concurrency 8); **[DSA](#accuracy-evaluation) gained an identity control** (byte-identical to DSA off below the selection width) and a `gsm8k_cot` figure. |
+| 2026-09-11 | Measured on GLM-5.3 weights, plus one code change. **[The two configuration levers compose](#the-two-configuration-levers-compose-2138-toks)** — **21.38 tok/s, 1.35× the published 15.79**, TPOT −31 %; **[MTP's speed](#speculative-decoding-mtp-speed)** measured (**+18.6 %** on prose, +4.3 % on random — the dataset moves it 4.3×), and its draft MoE **drops an obsolete einsum workaround** for the kernel path (**12.44 tok/s**); **[DSA gained a matched dense counterpart](#dsa-against-a-matched-dense-run)** — 2.1–3.0× slower on decode, so it stays off. |
+| 2026-09-01 | Retargeted onto **`zai-org/GLM-5.3`**, which supersedes GLM-5.2-FP8. Verified on the new weights in the same pass: **[Automatic Prefix Caching](#automatic-prefix-caching-apc) enabled and measured** (60.2 % lower median TTFT, 1.25× output throughput, at the predicted hit rate); **[`decode_context_length_buckets`](#setting-decode_context_length_buckets-cuts-decode-time-by-a-third) measured for the first time** (−36.0 % TPOT, TTFT unchanged) and now recommended; **[batching](#batching-scales-to-612-at-the-engines-maximum) measured to the engine's ceiling** (6.12× at concurrency 8); **[DSA](#accuracy-evaluation) gained an identity control** (byte-identical to DSA off below the selection width) and a `gsm8k_cot` figure. |
 | 2026-08-31 | Re-hosted onto Neuron 2.32 / vllm-neuron 0.24 (from Neuron 2.31 / 0.21), and extended in the same release: **segmented prefill** made correct and verified on device to `max-model-len` 65536; **speculative decoding (MTP)** at `num_speculative_tokens=1`; the **DSA sparse-attention indexer** as an opt-in path that runs on device at one configuration. Also fixes a prior-KV mask bound in `forward_decode` reachable only under speculation. See [Verification scope](#verification-scope). |
 | 2026-07-28 | Initial contribution, on vllm-neuron 0.21 / Neuron 2.31. Adds the `glm_5_2` model package — a 78-layer decoder combining **Multi-head Latent Attention (MLA)** with a **256-expert MoE** (top-8 sigmoid routing plus one always-on shared expert, first three layers dense) — in **FP8 per-channel ROW** at TP=64 / EP=16, with the tiled MLA attention path, the FP8 dequant-and-shard weight loaders and the halved MLA KV page. Component equivalence against `transformers.models.glm_moe_dsa` 13/13 (all R < 1.2). The DSA indexer was **not** included and full attention was used instead. Superseded by this branch and kept at the [`add-glm-5-2-231`](https://github.com/htokoyo/vllm-neuron/blob/add-glm-5-2-231/GLM-5.2/README.md) tag for anyone still on that stack. |
 
@@ -87,10 +88,10 @@ which checkpoint produced each row. Shapes and graphs carry over between them; *
 | MTP byte-identity vs a non-speculative run | **Not expected to hold**, and not a defect; the verify step reads logits at a different shape — see [Accuracy Evaluation](#accuracy-evaluation) |
 | DSA above `max_model_len=4096`, or alongside MTP | Not compiled, so not exercised — see [Accuracy Evaluation](#accuracy-evaluation) |
 | DSA **selecting** rather than covering | Only the 3,518-token needle test runs above the 2,048-key selection width — see [Accuracy Evaluation](#accuracy-evaluation) |
-| DSA speed against a matched dense run | No dense counterpart was built at that configuration, so neither a speedup nor a slowdown is claimed |
+| DSA speed against a matched dense run | **Measured, and DSA is slower** at every length tried up to 7,000 input tokens — see [DSA against a matched dense run](#dsa-against-a-matched-dense-run). DSA remains off by default |
 | NKI MLA attention kernel | Opt-in (`VLLM_GLM_MLA_BLOCK_KERNEL=1`), CPU-simulator validated only, **never run on device** |
 | On-device top-k / top-p sampling | Supported by `OnDeviceSamplingConfig` (`max_top_k`), but not exercised — every configuration here compiled the `all_greedy` sampling graph |
-| `logprobs` on the served endpoint | Returns HTTP 500; the reported fix changes the sampling graph and is untested — see [Accuracy Evaluation](#accuracy-evaluation) |
+| `logprobs` on the served endpoint | **Works with `--no-async-scheduling`, but only without speculation** (HTTP 500 otherwise). No recompile — the flag selects a scheduler, not a graph — and costs about 3 % throughput. 🔴 With MTP enabled it still returns HTTP 500 — see [Accuracy Evaluation](#accuracy-evaluation) |
 | Concurrency above `max_num_seqs=8`, or APC / DSA / MTP under concurrency | Not exercised — the batching figures are one prompt length at one `max_model_len` |
 | Parallel degrees other than TP=64 / EP=16 | Not exercised |
 | Pipeline parallelism, multi-node | Not implemented |
@@ -284,9 +285,10 @@ export NEURON_LIBTORCH_COMPILATION_TIMEOUT=3600
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 
 # Scratchpad settings used during bring-up
-export NEURON_CC_FLAGS="--hbm-scratchpad-page-size=512"
 export NEURON_SCRATCHPAD_PAGE_SIZE=512
 export NEURON_SKIP_EFA_AFFINITY=1
+
+# NEURON_CC_FLAGS is not set: this backend builds the compiler arguments itself and never reads it.
 
 # Serial TRACE only — parallel trace host-OOMs. 🔴 Exactly this spelling: others are silently ignored.
 export NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS=1
@@ -433,7 +435,7 @@ APC off / on-device `all_greedy`:
 
 C and D are segmented-prefill, A and B single-shot. The KV cache is the same in all four
 because it is sized from free HBM after weights, not from `max_model_len`; what changes is how
-much of it one request can occupy. The MTP and DSA runs in **4** and **5** below each used a
+much of it one request can occupy. The MTP and DSA runs in **3** and **4** below each used a
 further configuration of their own (`max_model_len` 2,048 and 4,096 respectively), stated there.
 
 **1. Accuracy — component equivalence.** Each component of this port is compared
@@ -474,7 +476,7 @@ own BF16 does; for RMSNorm the cause is explicit, HF rounds the normalised hidde
 > ⚠️ **n = 100**, via `--limit`, on **GLM-5.2-FP8 weights** — measured before the retarget and not
 > re-measured on 5.3, and accuracy is the one thing that depends on the weights rather than on the
 > shapes the two checkpoints share. This run is configuration **B**
-> (`max_model_len=4096`, `max_num_seqs=8`); the pair in **4** below is a **separate, later run**
+> (`max_model_len=4096`, `max_num_seqs=8`); the pair in **3** below is a **separate, later run**
 > at `max_model_len=2048` / `max_num_seqs=1`, which is why its numbers differ from these by about
 > one standard error.
 
@@ -491,7 +493,7 @@ num_concurrent=8,max_retries=3,timeout=1800,tokenized_requests=False,tokenizer=/
 > server-side error. (`--batch_size` is ignored whenever `num_concurrent > 1`: the generative path
 > passes `n=0` to the batcher, so it does not compound the concurrency.)
 
-**4. Speculative decoding (MTP).** Measured against a non-speculative run on the same build
+**3. Speculative decoding (MTP).** Measured against a non-speculative run on the same build
 and the same instance:
 
 | | MTP, `num_speculative_tokens=1` | non-speculative |
@@ -509,14 +511,13 @@ floating-point expression. Standing in for a direct check, and off device: a 5-l
 puts the logit difference between the shapes at **3.1e-02** against a top-1/top-2 gap of
 **1.25e+00** — a 40× margin, so the shape rarely changes which token wins.
 
-> ⚠️ So "every divergence is a near-tie" is *inferred*, not checked position by position:
-> `logprobs` on `/v1/completions` returns **HTTP 500 `list index out of range`** on this build. The
-> same request without `logprobs` succeeds immediately before and after it, so the failure belongs to
-> `logprobs` and not to a sick engine. It is reported to need `max_logprobs` and
-> `--no-async-scheduling` — untested here, because `max_logprobs` changes the sampling graph and
-> costs a cold compile — and the offline `LLM` API is reported to return them without either.
+> ⚠️ So "every divergence is a near-tie" is *inferred*, not checked position by position, and it
+> **cannot be checked on this build**: the check needs `logprobs` from the MTP arm, and `logprobs`
+> fails under speculation — a non-speculative server with **`--no-async-scheduling`** returns them
+> (no recompile, about **3 %** throughput), but the MTP server, already running with that flag,
+> still returns **HTTP 500**.
 
-**5. DSA sparse-attention indexer.** Opt-in (`VLLM_GLM_DSA=1`), and what was verified is narrow:
+**4. DSA sparse-attention indexer.** Opt-in (`VLLM_GLM_DSA=1`), and what was verified is narrow:
 
 | | Weights | |
 |---|---|---|
@@ -524,7 +525,7 @@ puts the logit difference between the shapes at **3.1e-02** against a top-1/top-
 | Graphs compiled | 5.2-FP8 | 896, no compile errors |
 | KV cache | 5.2-FP8 | 64,736 tokens, against 79,136 with DSA off — the 704/576 row-width ratio |
 | Retrieval, 3,518-token context (the selection keeps 2,048 of 3,518 keys) | 5.2-FP8 | needle found at **10 %, 50 % and 90 % depth** |
-| Decode latency at that context | 5.2-FP8 | **155.7 ms/token**, from the slope of two output lengths (8 and 72, `ignore_eos`) so prefill and client overhead cancel |
+| Decode latency at that context | 5.2-FP8 | **155.7 ms/token**, from the slope of two output lengths (8 and 72, `ignore_eos`) so prefill and client overhead cancel. **No dense counterpart at this configuration** — for DSA against a matched dense run see [Measured performance](#dsa-against-a-matched-dense-run) |
 | Identity control below the selection width | **5.3** | 128 greedy tokens from a 1,012-token prompt are **byte-identical** to the same request with DSA off |
 | Accuracy with the indexer active | **5.3** | `gsm8k_cot` at n=100: **0.91** ± 0.029 strict-match, **0.90** ± 0.030 flexible-extract |
 
@@ -549,30 +550,6 @@ puts the logit difference between the shapes at **3.1e-02** against a top-1/top-
 > DSA has not been run alongside speculative decoding. And **DSA does not
 > reduce work in this form**: the attention pass still visits every key and masks the unselected
 > ones, so what it buys is fidelity to the trained model, not speed.
-
-**6. Automatic Prefix Caching (APC).** Two runs of the same benchmark on the same server, with
-`--prefix-repetition-num-prefixes` as the only variable — 5 distinct prefixes shared across 50
-prompts (heavy reuse) against 50 distinct prefixes (nothing to reuse). On **GLM-5.3** weights.
-`max_model_len=2048`, `kv_segment_size=512`, prefix 1,536 tokens (three whole segments), suffix 384,
-output 128, `--max-concurrency 1`, `--ignore-eos`:
-
-| | Median TTFT | Output throughput | Prefix cache hit rate |
-|---|---:|---:|---:|
-| 5 shared prefixes | **1,762 ms** | **13.66 tok/s** | 73–74 % |
-| 50 distinct prefixes (control) | 4,429 ms | 10.89 tok/s | ~0 % |
-| | **−60.2 %** | **1.25×** | |
-
-The hit rate matches the 72.0 % the workload's token counts predict, and the TTFT saving is 80 % of
-the 75 % ceiling that skipping three of four segments allows.
-
-> ⚠️ **The control is what makes this a measurement.** A first request is often faster than its
-> successors here for reasons unrelated to caching — probing by hand with three repeats gave 0.905 s
-> on a shared-prefix request *and* 1.789 s on an unrelated one, both against a 3.88 s steady state,
-> so a single fast request proves nothing. Only the median over 50 prompts, against a workload with
-> no overlap, separates prefix reuse from that effect.
-
-> ⚠️ **What is not claimed.** One shape at one segment size, single concurrency. Nothing is measured
-> for concurrent requests, for larger `max_model_len`, or with DSA or MTP enabled alongside it.
 
 ## Measured performance
 
@@ -711,6 +688,117 @@ a prefill slot.
 
 > ⚠️ Measured at one prompt length and one `max_model_len`, with `decode_context_length_buckets`
 > unset. Nothing above `max_num_seqs=8` was tried.
+
+### The two configuration levers compose: 21.38 tok/s
+
+The table above varies concurrency with `decode_context_length_buckets` unset; the
+[bucket section](#setting-decode_context_length_buckets-cuts-decode-time-by-a-third) varies the
+bucket at concurrency 1. Setting **both** — `max_model_len=4096`,
+`num_batched_tokens_buckets: [4096]`, `num_seqs_buckets: [8]`,
+`decode_context_length_buckets: [2048]` — and re-running the same workload (993-token prompts, 128
+output tokens, `--ignore-eos`) on the same weights gives:
+
+| Concurrency | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Output throughput | 3.94 tok/s | 7.36 tok/s | 13.05 tok/s | **21.38 tok/s** |
+| Speedup over concurrency 1 | 1.00× | 1.87× | 3.31× | **5.43×** |
+| Median TPOT | 238.48 ms | 247.10 ms | 264.19 ms | **298.32 ms** |
+
+**21.38 tok/s is 1.35× the 15.79 tok/s above, and no kernel was changed** — two configuration
+values, each already documented separately, that had not been measured together. Median TPOT
+improves by 31 % at concurrency 8 (432.48 → 298.32 ms) and by 36 % at concurrency 1.
+
+⚠️ **The batch speedup falls to 5.43× from 6.12×, and that is not a regression.** Concurrency 1 got
+faster (2.58 → 3.94 tok/s), so the ratio is measured against a larger denominator. Efficiency
+against the ideal 8× is 68 % here against 77 % above.
+
+> ✅ Validity control: median TPOT at concurrency 1 reproduced an earlier run of this same
+> configuration to within **0.2 %** (238.48 ms against 238.94 ms) on a different instance of the same
+> type. Without that the rest of the table would not be quotable.
+
+> ⚠️ Same limits as the table above: one prompt length, one `max_model_len`, one bucket value,
+> greedy on-device sampling, nothing above `max_num_seqs=8`. `max_num_seqs=16` was tried and does
+> not fit this configuration.
+
+### Automatic Prefix Caching (APC)
+
+Two runs of the same benchmark on the same server, with
+`--prefix-repetition-num-prefixes` as the only variable — 5 distinct prefixes shared across 50
+prompts (heavy reuse) against 50 distinct prefixes (nothing to reuse). On **GLM-5.3** weights.
+`max_model_len=2048`, `kv_segment_size=512`, prefix 1,536 tokens (three whole segments), suffix 384,
+output 128, `--max-concurrency 1`, `--ignore-eos`:
+
+| | Median TTFT | Output throughput | Prefix cache hit rate |
+|---|---:|---:|---:|
+| 5 shared prefixes | **1,762 ms** | **13.66 tok/s** | 73–74 % |
+| 50 distinct prefixes (control) | 4,429 ms | 10.89 tok/s | ~0 % |
+| | **−60.2 %** | **1.25×** | |
+
+The hit rate matches the 72.0 % the workload's token counts predict, and the TTFT saving is 80 % of
+the 75 % ceiling that skipping three of four segments allows.
+
+> ⚠️ **The control is what makes this a measurement.** A first request is often faster than its
+> successors here for reasons unrelated to caching — probing by hand with three repeats gave 0.905 s
+> on a shared-prefix request *and* 1.789 s on an unrelated one, both against a 3.88 s steady state,
+> so a single fast request proves nothing. Only the median over 50 prompts, against a workload with
+> no overlap, separates prefix reuse from that effect.
+
+> ⚠️ **What is not claimed.** One shape at one segment size, single concurrency. Nothing is measured
+> for concurrent requests, for larger `max_model_len`, or with DSA or MTP enabled alongside it.
+
+### Speculative decoding (MTP) speed
+
+The accuracy of MTP is in [Accuracy Evaluation](#accuracy-evaluation); this is its speed, measured
+separately at `max_model_len=2048`, segmented prefill 512, `max_num_seqs=1`,
+`num_speculative_tokens=1`, both arms warm, 128 output tokens with `--ignore-eos`:
+
+| Dataset | Mean acceptance length | non-speculative | MTP | MTP gain | Median TPOT |
+|---|---:|---:|---:|---:|---|
+| Random token sequences | 1.18 | 11.50 tok/s | 11.99 tok/s | **+4.3 %** | 71.07 → 67.27 ms |
+| English prose | 1.73 | 10.38 tok/s | 12.31 tok/s | **+18.6 %** | 71.84 → **56.99 ms** |
+
+**The dataset moves the answer by 4.3×.** Random tokens understate speculation structurally —
+acceptance length collapses to 1.18 of a possible 2, against 1.73 on prose — so **+18.6 % is the
+favourable end and +4.3 % the unfavourable one**, and production traffic should fall between them.
+
+> ⚠️ Read within a row, not across rows: the prose loader packs whole lines, so its prompts come out
+> at 845 tokens against 993. One concurrency, two requests per arm.
+
+**The draft's MoE now takes the same kernel path as the target.** Earlier releases routed the draft's
+layer-78 decode MoE through a kernel-free einsum path, to avoid an indirect-DMA over-read at the γ=1
+verify shape; `_forward_decode` now pads the token count up to a multiple of 16, which covers that
+shape, so the workaround was obsolete. Removing it, with the non-speculative control unchanged at
+11.5 tok/s:
+
+| MTP draft decode MoE | tok/s | Median TPOT |
+|---|---:|---:|
+| einsum path (previous) | 12.22 | 67.68 ms |
+| `moe_tkg` kernel path (now) | **12.44** | **65.88 ms** |
+
+> ⚠️ **+1.8 %** is small because decode here is not bandwidth-bound — the draft's MoE reads drop
+> roughly 32× but the bytes were not what bound it. It is also **not numerically neutral**: mean
+> acceptance length moved 1.40 → 1.33, so the two paths round differently enough to change which
+> draft tokens are accepted. Two requests, one configuration.
+
+### DSA against a matched dense run
+
+Both arms were built at the same `max_model_len=8192` / 512-wide segmented prefill, with
+`decode_context_length_buckets` of 2048 and 4096, so one compile per arm covers three lengths
+(7,000 falls into the implicit `max_model_len` bucket). `max_num_seqs=1`, 128 output tokens,
+`--ignore-eos`, both arms warm.
+
+| Input tokens | Decode bucket | Dense TPOT | DSA TPOT | Dense TTFT | DSA TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 1,500 | 2048 | **57.71 ms** | 121.81 ms | 3,853 ms | 33,358 ms |
+| 3,500 | 4096 | **62.29 ms** | 159.55 ms | 9,005 ms | 77,716 ms |
+| 7,000 | 8192 | **80.44 ms** | 243.87 ms | 18,113 ms | 155,338 ms |
+
+**DSA costs 2.1× to 3.0× on decode here, and the gap widens with context** (2.11× → 2.56× → 3.03×)
+instead of narrowing, so the overhead is not the indexer arithmetic alone; TTFT is a near-constant
+8.6×. ⚠️ These lengths sit well below the ones sparse selection targets, so the claim is narrow —
+*at 8,192 and below, on this port, enabling DSA costs 2–3× decode latency*, which is the reason it
+stays off by default. One concurrency, two requests per point; `tok/s` is omitted because the
+512-wide segment inflates TTFT for both arms for reasons unrelated to DSA.
 
 ## Contents of this bundle
 
